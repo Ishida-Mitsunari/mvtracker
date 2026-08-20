@@ -1,0 +1,32 @@
+# @package _global_
+# Zero-shot eval of the official MV-Kubric checkpoint on NuscTrack val.
+defaults:
+  - override /model: mvtracker
+
+experiment_path: ./logs/mvtracker-nuscenes-eval
+restore_ckpt_path: checkpoints/mvtracker_200000_june2025.pth
+
+datasets:
+  root: /home/yangyi/nuscenes
+  train:
+    name: nuscenes-multiview-omnidc-train
+    batch_size: 1
+    sequence_len: 24
+    traj_per_sample: 384
+    num_workers: 4
+  eval:
+    names: [nuscenes-multiview-omnidc-val]
+    num_workers: 2
+    max_seq_len: 24
+
+evaluation:
+  interp_shape: [432, 768]
+  eval_iters: 4
+
+model:
+  use_flash_attention: false
+
+modes:
+  eval_only: true
+  validate_at_start: false
+  do_initial_static_pretrain: false

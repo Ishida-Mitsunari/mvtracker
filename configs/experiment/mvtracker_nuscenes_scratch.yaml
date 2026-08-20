@@ -1,0 +1,52 @@
+# @package _global_
+# Train MVTracker from scratch on NuscTrack (no MV-Kubric weights).
+defaults:
+  - override /model: mvtracker
+
+experiment_path: ./logs/mvtracker-nuscenes-scratch
+restore_ckpt_path: null
+
+datasets:
+  root: /home/yangyi/nuscenes
+  train:
+    name: nuscenes-multiview-omnidc-train
+    batch_size: 1
+    sequence_len: 24
+    traj_per_sample: 384
+    num_workers: 4
+  eval:
+    names: [nuscenes-multiview-omnidc-val]
+    num_workers: 2
+    max_seq_len: 24
+
+trainer:
+  num_steps: 20000
+  eval_freq: 2000
+  viz_freq: 2000
+  save_ckpt_freq: 1000
+  lr: 0.0005
+  precision: 32-true
+  augment_train_iters: false
+
+evaluation:
+  interp_shape: [432, 768]
+  eval_iters: 4
+
+model:
+  use_flash_attention: false
+
+augmentations:
+  probability: 0.5
+  rgb: true
+  depth: false
+  cropping: false
+  variable_trajpersample: false
+  scene_transform: false
+  camera_params_noise: false
+  variable_depth_type: false
+  variable_num_views: false
+
+modes:
+  eval_only: false
+  validate_at_start: false
+  do_initial_static_pretrain: false

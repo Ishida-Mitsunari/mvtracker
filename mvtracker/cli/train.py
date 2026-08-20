@@ -34,6 +34,7 @@ from mvtracker.datasets import KubricMultiViewDataset
 from mvtracker.datasets import TapVidDataset
 from mvtracker.datasets import kubric_multiview_dataset
 from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
+from mvtracker.datasets.nuscenes_multiview_dataset import NuScenesMultiViewDataset
 from mvtracker.datasets.panoptic_studio_multiview_dataset import PanopticStudioMultiViewDataset
 from mvtracker.datasets.utils import collate_fn, dataclass_to_cuda_
 from mvtracker.models.core.losses import balanced_ce_loss, sequence_loss_3d
@@ -244,6 +245,8 @@ def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
             predictor_settings = cfg.evaluation.predictor_settings["dex_ycb"]
         elif ds_name.startswith("panoptic"):
             predictor_settings = cfg.evaluation.predictor_settings["panoptic"]
+        elif ds_name.startswith("nuscenes"):
+            predictor_settings = cfg.evaluation.predictor_settings["nuscenes"]
         elif ds_name.startswith("tapvid2d-davis"):
             predictor_settings = cfg.evaluation.predictor_settings["tapvid2d-davis"]
         else:
@@ -417,6 +420,8 @@ def main(cfg: DictConfig):
             eval_dataset = PanopticStudioMultiViewDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name.startswith("dex-ycb-multiview"):
             eval_dataset = DexYCBMultiViewDataset.from_name(dataset_name, cfg.datasets.root)
+        elif dataset_name.startswith("nuscenes-multiview"):
+            eval_dataset = NuScenesMultiViewDataset.from_name(dataset_name, cfg.datasets.root, cfg)
         elif dataset_name == "egoexo4d":
             eval_dataset = GenericSceneDataset(
                 dataset_dir="datasets/egoexo4d-processed/maxframes-300_downsample-1_downscale-512/",
@@ -539,6 +544,8 @@ def main(cfg: DictConfig):
         train_dataset = None
     elif cfg.datasets.train.name.startswith("kubric-multiview-v3"):
         train_dataset = KubricMultiViewDataset.from_name(cfg.datasets.train.name, cfg.datasets.root, cfg, fabric)
+    elif cfg.datasets.train.name.startswith("nuscenes-multiview"):
+        train_dataset = NuScenesMultiViewDataset.from_name(cfg.datasets.train.name, cfg.datasets.root, cfg)
     else:
         raise ValueError(f"Dataset {cfg.datasets.train.name} not supported for training")
 
