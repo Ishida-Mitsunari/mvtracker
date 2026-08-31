@@ -38,10 +38,6 @@ evaluation:
       visibility_threshold: 0.01
       grid_size: 6
       local_grid_size: 18
-    nuscenes:
-      visibility_threshold: 0.5
-      grid_size: 4
-      local_grid_size: 18
     tapvid2d-davis:
       visibility_threshold: 0.01
       grid_size: 6

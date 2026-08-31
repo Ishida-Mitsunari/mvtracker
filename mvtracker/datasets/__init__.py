@@ -1,5 +1,4 @@
 from .dexycb_multiview_dataset import DexYCBMultiViewDataset
 from .kubric_multiview_dataset import KubricMultiViewDataset
-from .nuscenes_multiview_dataset import NuScenesMultiViewDataset
 from .panoptic_studio_multiview_dataset import PanopticStudioMultiViewDataset
 from .tap_vid_datasets import TapVidDataset

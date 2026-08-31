@@ -105,14 +105,6 @@ def evaluate_3dpt(
         static_threshold = None
         dynamic_threshold = None
         very_dynamic_threshold = None
-    elif evaluation_setting == "nuscenes-multiview":
-        # NuscTrack / BEVTracker: TAPVid-3D metric thresholds in meters.
-        assert n_point_dim == 3
-        distance_thresholds = [0.01, 0.04, 0.16, 0.64, 2.56]
-        survival_distance_threshold = 5.0
-        static_threshold = None
-        dynamic_threshold = None
-        very_dynamic_threshold = None
     elif evaluation_setting == "tapvid2d":
         assert n_point_dim == 2
         distance_thresholds = [1, 2, 4, 8, 16]  # pixels
@@ -171,13 +163,6 @@ def evaluate_3dpt(
 
     for k in results_dict:
         results_dict[k] = results_dict[k].item()
-
-    # evaluate_predictions multiplies every metric by 100 (TAP-Vid %). Keep
-    # AJ / APD / OA as percentages, but report MTE / ATE / FDE in meters.
-    if evaluation_setting == "nuscenes-multiview":
-        for k in list(results_dict.keys()):
-            if any(token in k for token in ("mte_visible", "ate_visible", "fde_visible")):
-                results_dict[k] = results_dict[k] / 100.0
 
     if verbose:
         logging.info(f"3DPT results:\n{results_dict}")
@@ -550,8 +535,6 @@ class Evaluator:
                 evaluation_setting = "panoptic-multiview"
             elif "dex-ycb" in dataset_name:
                 evaluation_setting = "dexycb-multiview"
-            elif "nuscenes-multiview" in dataset_name:
-                evaluation_setting = "nuscenes-multiview"
             elif "tapvid2d" in dataset_name:
                 evaluation_setting = "tapvid2d"
             elif no_tracking_labels:
@@ -593,7 +576,7 @@ class Evaluator:
             gt_visibilities_any_view = gt_visibilities_per_view.any(dim=1)
             assert gt_visibilities_any_view.any(dim=1).all(), "All points should be visible in at least one view."
             per_track_results = None
-            if evaluation_setting in ["kubric-multiview", "panoptic-multiview", "dexycb-multiview", "nuscenes-multiview"]:
+            if evaluation_setting in ["kubric-multiview", "panoptic-multiview", "dexycb-multiview"]:
                 eval_3dpt_results_dict = evaluate_3dpt(
                     gt_tracks=gt_trajectories_3d_worldspace[0].cpu().numpy(),
                     gt_visibilities=gt_visibilities_any_view[0].cpu().numpy(),
@@ -737,8 +720,6 @@ class Evaluator:
             viz_fps = 30
             if "panoptic" in dataset_name:
                 viz_fps = 30
-            elif "nuscenes" in dataset_name:
-                viz_fps = 5
             elif "dex" in dataset_name:
                 viz_fps = 10
             elif "kubric" in dataset_name:
