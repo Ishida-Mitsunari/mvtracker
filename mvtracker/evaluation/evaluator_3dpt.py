@@ -10,6 +10,7 @@ from typing import Optional
 
 import imageio
 import matplotlib.cm as cm
+import matplotlib.pyplot as plt
 import numpy as np
 import rerun as rr
 import torch
@@ -20,6 +21,14 @@ from tqdm import tqdm
 
 from mvtracker.datasets.utils import dataclass_to_cuda_
 from mvtracker.evaluation.metrics import compute_tapvid_metrics_original, evaluate_predictions
+from mvtracker.evaluation.nusctrack_eval import (
+    THRESHOLDS,
+    aggregate_track_evals,
+    compute_query_cam_2d_eval,
+    compute_track_eval,
+    dump_tap_metrics,
+    summarize_track_eval,
+)
 from mvtracker.models.core.model_utils import world_space_to_pixel_xy_and_camera_z, \
     pixel_xy_and_camera_z_to_world_space, init_pointcloud_from_rgbd
 from mvtracker.utils.visualizer_mp4 import log_mp4_track_viz
@@ -179,6 +188,8 @@ class Evaluator:
             rerun_viz_indices: Optional[Iterable[int]] = None,
             forward_pass_log_indices: Optional[Iterable[int]] = None,
             mp4_track_viz_indices: Optional[Iterable[int]] = (0, 3, 4, 5),
+            save_tracks_npz: bool = True,
+            dump_nusctrack_metrics: bool = True,
     ) -> None:
         """
         Initializes the Evaluator.
@@ -200,6 +211,8 @@ class Evaluator:
         self.rerun_viz_indices = rerun_viz_indices
         self.forward_pass_log_indices = forward_pass_log_indices
         self.mp4_track_viz_indices = mp4_track_viz_indices
+        self.save_tracks_npz = bool(save_tracks_npz)
+        self.dump_nusctrack_metrics = bool(dump_nusctrack_metrics)
 
         if self.rerun_viz_indices is None:
             self.rerun_viz_indices = []
@@ -219,10 +232,15 @@ class Evaluator:
             step: Optional[int] = 0,
     ):
         metrics = {}
-        assert len(test_dataloader) > 0
+        nusctrack_records = []
         total_fps = 0.0
         count = 0
-        for datapoint_idx, datapoint in enumerate(tqdm(test_dataloader)):
+        n_loader = len(test_dataloader)
+        if n_loader == 0:
+            logging.warning("Eval dataloader is empty on this rank.")
+            metrics["__nusctrack_records__"] = []
+            return metrics
+        for datapoint_idx, datapoint in enumerate(tqdm(test_dataloader, total=n_loader)):
             should_save_mp4_viz = datapoint_idx in self.mp4_track_viz_indices
             should_save_forward_pass_logs = datapoint_idx in self.forward_pass_log_indices
             should_save_rerun_viz = datapoint_idx in self.rerun_viz_indices
@@ -269,6 +287,11 @@ class Evaluator:
                                if datapoint.query_points is not None else None)
             query_points_3d = (datapoint.query_points_3d.clone().float().to(device)
                                if datapoint.query_points_3d is not None else None)
+            query_points_view = (
+                datapoint.query_points_view.clone().long().to(device)
+                if getattr(datapoint, "query_points_view", None) is not None
+                else None
+            )
 
             # Non-per-view data
             gt_trajectories_3d_worldspace = datapoint.trajectory_3d
@@ -439,8 +462,8 @@ class Evaluator:
                         c_min, c_max = c_all.min(), c_all.max()
 
                     # Colormaps
-                    depth_cmap = cm.get_cmap("turbo")
-                    conf_cmap = cm.get_cmap("inferno")
+                    depth_cmap = plt.get_cmap("turbo")
+                    conf_cmap = plt.get_cmap("inferno")
 
                     rgb_video, depth_video, conf_video = [], [], []
                     for t in range(num_frames):
@@ -487,7 +510,10 @@ class Evaluator:
                 ),
 
             }
-            if "2dpt" in dataset_name:
+            if query_points_view is not None:
+                assert batch_size == 1
+                fwd_kwargs["query_points_view"] = query_points_view
+            elif "2dpt" in dataset_name:
                 assert batch_size == 1
                 query_timestep = query_points_3d[0, :, 0].cpu().numpy().astype(int)
                 query_points_view = gt_visibilities_per_view.argmax(dim=1)[0, query_timestep, torch.arange(num_points)]
@@ -537,6 +563,8 @@ class Evaluator:
                 evaluation_setting = "dexycb-multiview"
             elif "tapvid2d" in dataset_name:
                 evaluation_setting = "tapvid2d"
+            elif "nusctrack" in dataset_name:
+                evaluation_setting = "nusctrack"
             elif no_tracking_labels:
                 evaluation_setting = "no-tracking-labels"
             else:
@@ -550,27 +578,34 @@ class Evaluator:
             assert intrs_inv.shape == (batch_size, num_views, num_frames, 3, 3)
             assert extrs_inv.shape == (batch_size, num_views, num_frames, 4, 4)
 
-            # Project the predictions to pixel space for visualization
-            pred_trajectories_pixel_xy_camera_z_per_view = torch.stack([
-                torch.cat(world_space_to_pixel_xy_and_camera_z(
-                    world_xyz=pred_trajectories[0],
-                    intrs=intrs[0, view_idx],
-                    extrs=extrs[0, view_idx],
-                ), dim=-1)
-                for view_idx in range(num_views)
-            ], dim=0)
-            for view_idx in range(num_views):
-                pred_trajectories_reproduced = pixel_xy_and_camera_z_to_world_space(
-                    pixel_xy=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, :2],
-                    camera_z=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, 2:],
-                    intrs_inv=intrs_inv[0, view_idx],
-                    extrs_inv=extrs_inv[0, view_idx],
-                )
-                if not torch.allclose(pred_trajectories_reproduced, pred_trajectories, atol=1):
-                    warnings.warn(f"Reprojection of the predicted trajectories failed: "
-                                  f"view_idx={view_idx}, "
-                                  f"max_diff={torch.max(torch.abs(pred_trajectories_reproduced - pred_trajectories))}")
-            pred_trajectories_pixel_xy_camera_z_per_view = pred_trajectories_pixel_xy_camera_z_per_view[None]
+            need_pixel_proj = (
+                should_save_mp4_viz
+                or should_save_rerun_viz
+                or self.save_tracks_npz
+                or evaluation_setting in ["tapvid2d"]
+            )
+            pred_trajectories_pixel_xy_camera_z_per_view = None
+            if need_pixel_proj:
+                pred_trajectories_pixel_xy_camera_z_per_view = torch.stack([
+                    torch.cat(world_space_to_pixel_xy_and_camera_z(
+                        world_xyz=pred_trajectories[0],
+                        intrs=intrs[0, view_idx],
+                        extrs=extrs[0, view_idx],
+                    ), dim=-1)
+                    for view_idx in range(num_views)
+                ], dim=0)
+                for view_idx in range(num_views):
+                    pred_trajectories_reproduced = pixel_xy_and_camera_z_to_world_space(
+                        pixel_xy=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, :2],
+                        camera_z=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, 2:],
+                        intrs_inv=intrs_inv[0, view_idx],
+                        extrs_inv=extrs_inv[0, view_idx],
+                    )
+                    if not torch.allclose(pred_trajectories_reproduced, pred_trajectories, atol=1):
+                        warnings.warn(f"Reprojection of the predicted trajectories failed: "
+                                      f"view_idx={view_idx}, "
+                                      f"max_diff={torch.max(torch.abs(pred_trajectories_reproduced - pred_trajectories))}")
+                pred_trajectories_pixel_xy_camera_z_per_view = pred_trajectories_pixel_xy_camera_z_per_view[None]
 
             # Compute 3D metrics
             gt_visibilities_any_view = gt_visibilities_per_view.any(dim=1)
@@ -699,22 +734,114 @@ class Evaluator:
                 }
                 metrics[datapoint_idx].update(tapvid2d_original_metrics)
 
+            elif evaluation_setting in ["nusctrack"]:
+                # Ego 3D, fixed meters, no scale rescale. Do not nan_to_num preds.
+                pred_xyz = pred_trajectories[0]
+                gt_xyz = gt_trajectories_3d_worldspace[0]
+                valid_np = valid_tracks_per_frame[0]
+                # Datapoint vis is (V, T, N) -> protocol (T, N, K)
+                gt_vis_tnk = gt_visibilities_per_view[0].permute(1, 2, 0)
+                pred_vis_tn = pred_visibilities[0]
+                qf = query_points_3d[0, :, 0]
+                is_bg = getattr(datapoint, "is_background", None)
+                if is_bg is not None:
+                    is_bg = is_bg[0] if is_bg.ndim == 2 else is_bg
+                rec = compute_track_eval(
+                    pred_tracks=pred_xyz,
+                    pred_vis=pred_vis_tn,
+                    gt_tracks=gt_xyz,
+                    gt_vis=gt_vis_tnk,
+                    valid=valid_np,
+                    query_frames=qf,
+                    is_background=is_bg,
+                    vis_thresh=0.5,
+                    occ_as_visible=False,
+                )
+                native_2d = results.get("traj2d_e")
+                if native_2d is not None and query_points_view is not None:
+                    n_pts = pred_xyz.shape[1]
+                    qview = query_points_view[0].reshape(-1).long()
+                    # Per-track gather avoids mixed advanced-index layout surprises.
+                    gt_xy_qc = torch.stack(
+                        [
+                            gt_trajectories_2d_pixelspace_w_z_cameraspace[0, int(qview[n]), :, n, :2]
+                            for n in range(n_pts)
+                        ],
+                        dim=1,
+                    )
+                    gt_vis_qc = torch.stack(
+                        [
+                            gt_visibilities_per_view[0, int(qview[n]), :, n]
+                            for n in range(n_pts)
+                        ],
+                        dim=1,
+                    )
+                    pred_xy = native_2d[0]
+                    if pred_xy.ndim == 4:
+                        # (V, T, N, 2) leftover layout: take the query-cam pixel of each track
+                        pred_xy = torch.stack(
+                            [pred_xy[int(qview[n]), :, n] for n in range(n_pts)], dim=1
+                        )
+                    if pred_xy.shape[-1] > 2:
+                        pred_xy = pred_xy[..., :2]
+                    pred_vis_2d = pred_vis_tn
+                    if pred_vis_2d.ndim == 3:
+                        pred_vis_2d = pred_vis_2d.any(dim=-1)
+                    oob = (
+                        (pred_xy[..., 0] < 0)
+                        | (pred_xy[..., 0] >= width)
+                        | (pred_xy[..., 1] < 0)
+                        | (pred_xy[..., 1] >= height)
+                    )
+                    pred_vis_2d = pred_vis_2d & (~oob)
+                    rec_2d = compute_query_cam_2d_eval(
+                        pred_xy=pred_xy,
+                        pred_vis=pred_vis_2d,
+                        gt_xy=gt_xy_qc,
+                        gt_vis_querycam=gt_vis_qc,
+                        valid=valid_np,
+                        query_frames=qf,
+                        is_background=is_bg,
+                        image_hw=(height, width),
+                        vis_thresh=0.5,
+                    )
+                    rec.update(rec_2d)
+                clip_summary = summarize_track_eval(rec)
+                clip_summary["seq_name"] = seq_name
+                metrics[datapoint_idx] = clip_summary
+                nusctrack_records.append(rec)
+
             elif evaluation_setting in ["no-tracking-labels"]:
                 metrics[datapoint_idx] = {}
 
-            np.savez(
-                os.path.join(log_dir, f"step-{step}_seq-{seq_name}_tracks.npz"),
-                gt_trajectories_2d=gt_trajectories_2d_pixelspace_w_z_cameraspace.cpu().numpy(),
-                gt_trajectories_3d=gt_trajectories_3d_worldspace.cpu().numpy(),
-                gt_visibilities_per_view=gt_visibilities_per_view.cpu().numpy(),
-                gt_visibilities_any_view=gt_visibilities_any_view.cpu().numpy(),
-                pred_trajectories_2d=pred_trajectories_pixel_xy_camera_z_per_view.cpu().numpy(),
-                pred_trajectories_3d=pred_trajectories.cpu().numpy(),
-                pred_visibilities_any_view=pred_visibilities.cpu().numpy(),
-                query_points_2d=query_points_2d.cpu().numpy() if query_points_2d is not None else None,
-                query_points_3d=query_points_3d.cpu().numpy(),
-                track_upscaling_factor=track_upscaling_factor,
-            )
+            if self.save_tracks_npz:
+                np.savez(
+                    os.path.join(log_dir, f"step-{step}_seq-{seq_name}_tracks.npz"),
+                    gt_trajectories_2d=gt_trajectories_2d_pixelspace_w_z_cameraspace.cpu().numpy(),
+                    gt_trajectories_3d=gt_trajectories_3d_worldspace.cpu().numpy(),
+                    gt_visibilities_per_view=gt_visibilities_per_view.cpu().numpy(),
+                    gt_visibilities_any_view=gt_visibilities_any_view.cpu().numpy(),
+                    pred_trajectories_2d=pred_trajectories_pixel_xy_camera_z_per_view.cpu().numpy(),
+                    pred_trajectories_3d=pred_trajectories.cpu().numpy(),
+                    pred_visibilities_any_view=pred_visibilities.cpu().numpy(),
+                    query_points_2d=query_points_2d.cpu().numpy() if query_points_2d is not None else None,
+                    query_points_3d=query_points_3d.cpu().numpy(),
+                    query_points_view=(
+                        query_points_view.cpu().numpy() if query_points_view is not None else None
+                    ),
+                    valid=valid_tracks_per_frame.cpu().numpy() if valid_tracks_per_frame is not None else None,
+                    is_background=(
+                        datapoint.is_background.cpu().numpy()
+                        if getattr(datapoint, "is_background", None) is not None
+                        else None
+                    ),
+                    category_id=(
+                        datapoint.category_id.cpu().numpy()
+                        if getattr(datapoint, "category_id", None) is not None
+                        else None
+                    ),
+                    track_upscaling_factor=track_upscaling_factor,
+                )
 
             # Visualize the results with rerun.io
             viz_fps = 30
@@ -915,5 +1042,32 @@ class Evaluator:
             logging.info(f"\nAverage FPS across {count} datapoints: {avg_fps:.1f}")
         else:
             logging.warning("No datapoints were processed.")
+
+        if nusctrack_records:
+            metrics["__nusctrack_records__"] = nusctrack_records
+            if self.dump_nusctrack_metrics:
+                dataset_metrics = aggregate_track_evals(nusctrack_records)
+                header = [
+                    "NuscTrack / xTAP3D evaluation",
+                    "dataset: {}".format(dataset_name),
+                    "method: per-query-camera monocular 2D TAP, UniDepthV2 lift to ego 3D",
+                    "depth: UniDepthV2 (camera Z, lifted with the same K / cam2ego as the video)",
+                    "3D thresholds (m): {}".format(THRESHOLDS),
+                    "2D thresholds (px @ 256x256): 1, 2, 4, 8, 16",
+                    "scale rescale: none",
+                    "query: (cam, t, x, y) + UniDepth unproject (not GT xyz)",
+                    "aggregation: track micro-average (not clip-equal)",
+                    "n_clips: {}".format(len(nusctrack_records)),
+                ]
+                txt_path, json_path = dump_tap_metrics(
+                    dataset_metrics,
+                    os.path.join(log_dir, "nusctrack_metrics"),
+                    header_lines=header,
+                )
+                logging.info("Wrote NuscTrack metrics to %s", txt_path)
+                logging.info("\n%s", open(txt_path).read())
+                metrics["__dataset__"] = dataset_metrics
+        else:
+            metrics["__nusctrack_records__"] = []
 
         return metrics

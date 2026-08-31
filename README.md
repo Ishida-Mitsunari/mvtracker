@@ -256,6 +256,60 @@ For a full-scale MVTracker on an 80 GB GPU:
 python -m mvtracker.cli.train +experiment=mvtracker_overfit
 ```
 
+## NuscTrack (nuScenes surround-view TAP)
+
+Local adapter for [NuscTrack](https://github.com/Ishida-Mitsunari/mvtracker) clips under `/share/tgp/yangyi/nuscenes`: RGB + UniDepthV2, queries \((cam,t,x,y)\) lifted to ego (no GT 3D as query), 384 stratified tracks, \(432\times 768\), no scene-radius normalization.
+
+Use the venv and keep `PYTHONPATH` pointed at this repo. Do **not** leave `CUDA_VISIBLE_DEVICES` set to a single GPU. Official Kubric weights: `checkpoints/mvtracker_200000_june2025.pth` (if `huggingface.co` hangs, download via `https://hf-mirror.com/ethz-vlg/mvtracker/resolve/main/mvtracker_200000_june2025.pth`). Install `pointops` for kNN; 6-view \(432\times 768\) training also needs encoder checkpointing (already in the model).
+
+```bash
+cd /share/tgp/yangyi/mvtracker
+export PYTHONPATH=/share/tgp/yangyi/mvtracker
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Skip any busy GPU, e.g. GPU 2 occupied:
+export CUDA_VISIBLE_DEVICES=0,1,3,4,5,6,7
+```
+
+Run long jobs in tmux:
+
+```bash
+tmux new -s yangyi_mvtracker          # or: tmux attach -t yangyi_mvtracker
+```
+
+**CoTracker3 eval** (clip-sharded processes, not DDP; protocol metrics in the log dir):
+
+```bash
+# Smoke (2 clips)
+.venv/bin/python -m mvtracker.cli.eval_nusctrack_parallel \
+  --dataset nusctrack-val-max2 --gpus all \
+  --log-dir /share/tgp/yangyi/mvtracker/logs/cotracker3_offline_nusctrack
+
+# Full val
+.venv/bin/python -m mvtracker.cli.eval_nusctrack_parallel \
+  --dataset nusctrack-val --gpus all \
+  --log-dir /share/tgp/yangyi/mvtracker/logs/cotracker3_offline_nusctrack_val
+```
+
+Hydra equivalents: `configs/eval_nusctrack_cotracker3.yaml` (max2) and `configs/eval_nusctrack_cotracker3_val.yaml` (full val).
+
+**MVTracker Kubric-pretrained fine-tune** on `nusctrack-train` (AdamW \(5\times 10^{-5}\), 7000 steps, same experiment dir auto-resumes):
+
+```bash
+.venv/bin/python -m mvtracker.cli.train +experiment=mvtracker_nusctrack_ft
+# or: bash scripts/nusctrack_ft.sh
+```
+
+In-training eval uses `nusctrack-val-max2`. After training, full val:
+
+```bash
+.venv/bin/python -m mvtracker.cli.eval \
+  +experiment=mvtracker_nusctrack_ft \
+  modes.eval_only=true \
+  datasets.eval.names=[nusctrack-val] \
+  restore_ckpt_path=/share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_ft/model_final.pth \
+  experiment_path=/share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_ft_eval
+```
+
 ## Practical Considerations
 
 <details>

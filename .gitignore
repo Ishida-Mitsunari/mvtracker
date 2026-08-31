@@ -11,6 +11,7 @@ logs/
 slurm_logs/
 submit*
 logs*
+.venv/
 
 /running
 /datasets

@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from einops import rearrange
 from torch import nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from mvtracker.datasets.utils import transform_scene
 from mvtracker.models.core.cotracker2.blocks import Attention, FlashAttention
@@ -184,8 +185,20 @@ class MVTracker(nn.Module):
 
     def fnet_fwd(self, rgbs_normalized, image_features=None):
         b, v, t, _, h, w = rgbs_normalized.shape
-        rgbs_normalized = rgbs_normalized.reshape(-1, 3, h, w)
-        return self.fnet(rgbs_normalized)
+        x = rgbs_normalized.reshape(-1, 3, h, w)
+        # 6-view 432x768 encoder activations OOM a 48GB card if run as one batch.
+        # Chunk + checkpoint keeps the math identical and the peak much lower.
+        chunk = 8
+        outs = []
+        use_ckpt = bool(getattr(self, "is_train", False))
+        for i in range(0, x.shape[0], chunk):
+            xi = x[i : i + chunk]
+            if use_ckpt:
+                oi = torch_checkpoint(self.fnet, xi, use_reentrant=False)
+            else:
+                oi = self.fnet(xi)
+            outs.append(oi)
+        return torch.cat(outs, dim=0)
 
     def init_stats(self):
         self.stats_pyramid = defaultdict(list)

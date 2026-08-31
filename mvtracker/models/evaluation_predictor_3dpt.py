@@ -188,6 +188,7 @@ class EvaluationPredictor(torch.nn.Module):
                 support_uniform_pts = torch.stack(support_uniform_pts, dim=0)[None]  # (1, N, 4)
                 support_points = torch.cat([support_points, support_uniform_pts], dim=1)
 
+        traj2d_e = None
         if self.single_point:
             # Project the queries to each view
             # This will be needed if adding local grid points
@@ -358,6 +359,7 @@ class EvaluationPredictor(torch.nn.Module):
             )
             traj_e = results["traj_e"][:, :, :num_points, :]
             vis_e = results["vis_e"][:, :, :num_points]
+            traj2d_e = results["traj2d_e"][:, :, :num_points] if "traj2d_e" in results else None
 
             if save_debug_logs:
                 visualizer = MultiViewVisualizer(
@@ -407,11 +409,14 @@ class EvaluationPredictor(torch.nn.Module):
                         save_video=True,
                     )
 
-        return {
+        out = {
             "traj_e": traj_e,
             "vis_e": vis_e > self.visibility_threshold,
             "vis_e_as_prob": vis_e,
         }
+        if traj2d_e is not None:
+            out["traj2d_e"] = traj2d_e
+        return out
 
 
 def get_uniformly_sampled_pts(

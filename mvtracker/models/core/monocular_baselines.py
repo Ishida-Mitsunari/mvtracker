@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import warnings
 from typing import Tuple
@@ -12,12 +13,37 @@ from mvtracker.datasets.utils import transform_scene
 from mvtracker.models.core.model_utils import bilinear_sample2d, pixel_xy_and_camera_z_to_world_space
 from mvtracker.utils.visualizer_mp4 import Visualizer
 
+_COTRACKER_LOCAL_REPOS = (
+    "/share/tgp/yangyi/co-tracker",
+    os.path.expanduser("~/.cache/torch/hub/facebookresearch_co-tracker_main"),
+)
+
+
+def _load_cotracker_hub(model_name: str):
+    """Load official CoTracker weights; prefer a local clone so eval does not need GitHub."""
+    last_err = None
+    for repo in _COTRACKER_LOCAL_REPOS:
+        hubconf = os.path.join(repo, "hubconf.py")
+        if not os.path.isfile(hubconf):
+            continue
+        try:
+            return torch.hub.load(repo, model_name, source="local", trust_repo=True)
+        except Exception as exc:
+            last_err = exc
+            logging.warning("Local CoTracker load from %s failed: %s", repo, exc)
+    try:
+        return torch.hub.load("facebookresearch/co-tracker", model_name, trust_repo=True)
+    except Exception as exc:
+        if last_err is not None:
+            raise exc from last_err
+        raise
+
 
 class CoTrackerOfflineWrapper(nn.Module):
     def __init__(self, model_name="cotracker3_offline", grid_size=10):
         super(CoTrackerOfflineWrapper, self).__init__()
         self.grid_size = grid_size
-        self.cotracker = torch.hub.load("facebookresearch/co-tracker", model_name)
+        self.cotracker = _load_cotracker_hub(model_name)
 
     def forward(self, rgbs, queries, **kwargs):
         T, _, H, W = rgbs.shape
@@ -32,15 +58,17 @@ class CoTrackerOfflineWrapper(nn.Module):
             queries=queries[None].float(),
             grid_size=self.grid_size,
         )
-
-        return {"traj_2d": pred_tracks[0], "vis": pred_visibility[0]}
+        vis = pred_visibility[0, :, :N]
+        if vis.ndim > 2:
+            vis = vis.squeeze(-1)
+        return {"traj_2d": pred_tracks[0, :, :N, :2], "vis": vis}
 
 
 class CoTrackerOnlineWrapper(nn.Module):
     def __init__(self, model_name="cotracker3_online", grid_size=10):
         super(CoTrackerOnlineWrapper, self).__init__()
         self.grid_size = grid_size
-        self.cotracker = torch.hub.load("facebookresearch/co-tracker", model_name)
+        self.cotracker = _load_cotracker_hub(model_name)
 
     def forward(self, rgbs, queries, **kwargs):
         T, _, H, W = rgbs.shape
@@ -59,7 +87,10 @@ class CoTrackerOnlineWrapper(nn.Module):
         for t in range(0, T - self.cotracker.step, self.cotracker.step):
             pred_tracks, pred_visibility = self.cotracker(video_chunk=rgbs[None, t: t + self.cotracker.step * 2])
 
-        return {"traj_2d": pred_tracks[0], "vis": pred_visibility[0]}
+        vis = pred_visibility[0, :, :N]
+        if vis.ndim > 2:
+            vis = vis.squeeze(-1)
+        return {"traj_2d": pred_tracks[0, :, :N, :2], "vis": vis}
 
 
 class SpaTrackerV2Wrapper(nn.Module):
@@ -616,7 +647,9 @@ class MonocularToMultiViewAdapter(nn.Module):
         query_points_best_visibility_view = query_points_best_visibility_view.squeeze(-1)
 
         if query_points_view is not None:
-            query_points_best_visibility_view = query_points_view
+            if query_points_view.dim() == 1:
+                query_points_view = query_points_view[None]
+            query_points_best_visibility_view = query_points_view.long()
             logging.info(f"Using the provided query_points_view instead of the estimated one")
 
         assert batch_size == 1, "Batch size > 1 is not supported yet"
@@ -624,6 +657,7 @@ class MonocularToMultiViewAdapter(nn.Module):
 
         # Call the 2D tracker for each view
         traj_e_per_view = {}
+        traj2d_e_per_view = {}
         vis_e_per_view = {}
         for view_idx in range(num_views):
             track_mask = query_points_best_visibility_view[batch_idx] == view_idx
@@ -657,7 +691,8 @@ class MonocularToMultiViewAdapter(nn.Module):
                 queries_with_z=view_query_points_with_z,
                 queries_xyz_worldspace=view_query_points_xyz_worldspace,
             )
-            view_traj_e = results["traj_2d"]
+            view_traj_2d = results.get("traj_2d")
+            view_traj_e = view_traj_2d
             view_vis_e = results["vis"]
 
             if save_debug_logs and view_traj_e is not None:
@@ -693,7 +728,7 @@ class MonocularToMultiViewAdapter(nn.Module):
                 view_extrs_square[:, :3, :] = view_extrs
                 extrs_inv = torch.inverse(view_extrs_square.float())
                 view_traj_e = pixel_xy_and_camera_z_to_world_space(
-                    pixel_xy=view_traj_e[..., :].float(),
+                    pixel_xy=view_traj_e[..., :2].float(),
                     camera_z=view_camera_z.float(),
                     intrs_inv=intrs_inv,
                     extrs_inv=extrs_inv,
@@ -702,14 +737,21 @@ class MonocularToMultiViewAdapter(nn.Module):
             # Set the trajectory to (0,0,0) for the timesteps before the query timestep
             for point_idx, t in enumerate(query_points_t[batch_idx, :, :].squeeze(-1)[track_mask]):
                 view_traj_e[:t, point_idx, :] = 0.0
+                if view_traj_2d is not None:
+                    view_traj_2d[:t, point_idx, :] = 0.0
 
             traj_e_per_view[view_idx] = view_traj_e[None]
             vis_e_per_view[view_idx] = view_vis_e[None]
+            if view_traj_2d is not None:
+                traj2d_e_per_view[view_idx] = view_traj_2d[None]
 
         # Merging the results from all views
         views_to_keep = list(traj_e_per_view.keys())
         traj_e = torch.cat([traj_e_per_view[view_idx] for view_idx in views_to_keep], dim=2)
         vis_e = torch.cat([vis_e_per_view[view_idx] for view_idx in views_to_keep], dim=2)
+        traj2d_e = None
+        if len(traj2d_e_per_view) == len(views_to_keep) and len(views_to_keep) > 0:
+            traj2d_e = torch.cat([traj2d_e_per_view[view_idx] for view_idx in views_to_keep], dim=2)
 
         # Sort the traj_e and vis_e based on the original indices, since concatenating the results from all views
         # will first put the results from the first view, then the results from the second view, and so on.
@@ -727,9 +769,13 @@ class MonocularToMultiViewAdapter(nn.Module):
         # Use the inv_sort_inds to sort the traj_e and vis_e
         traj_e = traj_e[:, :, inv_sort_inds]
         vis_e = vis_e[:, :, inv_sort_inds]
+        if traj2d_e is not None:
+            traj2d_e = traj2d_e[:, :, inv_sort_inds]
 
         # Save to results
         results = {"traj_e": traj_e, "vis_e": vis_e}
+        if traj2d_e is not None:
+            results["traj2d_e"] = traj2d_e
         return results
 
 

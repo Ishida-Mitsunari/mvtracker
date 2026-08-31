@@ -34,6 +34,7 @@ from mvtracker.datasets import KubricMultiViewDataset
 from mvtracker.datasets import TapVidDataset
 from mvtracker.datasets import kubric_multiview_dataset
 from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
+from mvtracker.datasets.nusctrack_dataset import NuscTrackDataset
 from mvtracker.datasets.panoptic_studio_multiview_dataset import PanopticStudioMultiViewDataset
 from mvtracker.datasets.utils import collate_fn, dataclass_to_cuda_
 from mvtracker.models.core.losses import balanced_ce_loss, sequence_loss_3d
@@ -244,6 +245,9 @@ def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
             predictor_settings = cfg.evaluation.predictor_settings["dex_ycb"]
         elif ds_name.startswith("panoptic"):
             predictor_settings = cfg.evaluation.predictor_settings["panoptic"]
+        elif ds_name.startswith("nusctrack"):
+            predictor_settings = cfg.evaluation.predictor_settings["generic"]
+            logging.info(f"Using generic predictor settings for NuscTrack ({ds_name})")
         elif ds_name.startswith("tapvid2d-davis"):
             predictor_settings = cfg.evaluation.predictor_settings["tapvid2d-davis"]
         else:
@@ -274,12 +278,31 @@ def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
         if cfg.evaluation.consume_model_stats and hasattr(model, "consume_stats"):
             model.consume_stats()
 
-        metrics_to_log = {
-            k: np.nanmean([v[k] for v in metrics.values() if k in v]).round(2)
-            for k in metrics[0].keys()
-        }
+        clip_metrics = {k: v for k, v in metrics.items() if isinstance(k, int)}
+        if not clip_metrics:
+            logging.warning(f"No clip metrics for {ds_name}")
+            continue
+        if "__dataset__" in metrics:
+            metrics_to_log = {}
+            for k, v in metrics["__dataset__"].items():
+                if isinstance(v, (np.ndarray, dict)):
+                    continue
+                if isinstance(v, (np.floating, float)):
+                    metrics_to_log[k] = float(v)
+                elif isinstance(v, (np.integer, int)):
+                    metrics_to_log[k] = int(v)
+                else:
+                    metrics_to_log[k] = v
+        else:
+            first_key = next(iter(clip_metrics))
+            metrics_to_log = {
+                k: np.nanmean([v[k] for v in clip_metrics.values() if k in v and k != "seq_name"]).round(2)
+                for k in clip_metrics[first_key].keys()
+                if k != "seq_name"
+            }
         for k, v in metrics_to_log.items():
-            writer.add_scalar(k, v, step)
+            if isinstance(v, (int, float, np.floating, np.integer)) and np.isfinite(float(v)):
+                writer.add_scalar(k, float(v), step)
 
         with pd.option_context(
                 'display.max_rows', None,
@@ -287,12 +310,12 @@ def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
                 'display.max_colwidth', None,
                 'display.width', None,
         ):
-            logging.info(f"Per-sequence Metrics for {ds_name}: {pd.DataFrame(metrics)}")
-            logging.info(f"Average metrics for {ds_name}: {json.dumps(metrics_to_log, indent=4)}")
+            logging.info(f"Per-sequence Metrics for {ds_name}: {pd.DataFrame(clip_metrics)}")
+            logging.info(f"Average metrics for {ds_name}: {json.dumps(metrics_to_log, indent=4, default=str)}")
 
         # Save metrics to csv
         if log_dir_ds is not None:
-            df = pd.DataFrame(metrics)
+            df = pd.DataFrame(clip_metrics)
             df = df.T
             assert df.map(lambda x: (len(x) == 1) if isinstance(x, np.ndarray) else True).all().all()
             df = df.map(lambda x: x[0] if isinstance(x, np.ndarray) or isinstance(x, list) else x)
@@ -417,6 +440,8 @@ def main(cfg: DictConfig):
             eval_dataset = PanopticStudioMultiViewDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name.startswith("dex-ycb-multiview"):
             eval_dataset = DexYCBMultiViewDataset.from_name(dataset_name, cfg.datasets.root)
+        elif dataset_name.startswith("nusctrack"):
+            eval_dataset = NuscTrackDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name == "egoexo4d":
             eval_dataset = GenericSceneDataset(
                 dataset_dir="datasets/egoexo4d-processed/maxframes-300_downsample-1_downscale-512/",
@@ -539,6 +564,12 @@ def main(cfg: DictConfig):
         train_dataset = None
     elif cfg.datasets.train.name.startswith("kubric-multiview-v3"):
         train_dataset = KubricMultiViewDataset.from_name(cfg.datasets.train.name, cfg.datasets.root, cfg, fabric)
+    elif cfg.datasets.train.name.startswith("nusctrack"):
+        train_dataset = NuscTrackDataset.from_name(
+            cfg.datasets.train.name,
+            cfg.datasets.root,
+            n_traj=cfg.datasets.train.get("traj_per_sample", 384),
+        )
     else:
         raise ValueError(f"Dataset {cfg.datasets.train.name} not supported for training")
 

@@ -51,6 +51,11 @@ class Datapoint:
     novel_intrs: Optional[torch.Tensor] = torch.eye(3).unsqueeze(0)  # B, 3, 3
     novel_extrs: Optional[torch.Tensor] = None  # B, S, 4, 4
 
+    # NuscTrack / explicit query-view metadata (per point, no batch dim before collate)
+    query_points_view: Optional[torch.Tensor] = None  # N  (query camera index)
+    is_background: Optional[torch.Tensor] = None  # N
+    category_id: Optional[torch.Tensor] = None  # N
+
 
 def collate_fn(batch):
     gotit = [gotit for _, gotit in batch]
@@ -105,6 +110,21 @@ def collate_fn(batch):
         if batch[0][0].query_points_3d is not None
         else None
     )
+    query_points_view = (
+        torch.stack([b.query_points_view for b, _ in batch], dim=0)
+        if batch[0][0].query_points_view is not None
+        else None
+    )
+    is_background = (
+        torch.stack([b.is_background for b, _ in batch], dim=0)
+        if batch[0][0].is_background is not None
+        else None
+    )
+    category_id = (
+        torch.stack([b.category_id for b, _ in batch], dim=0)
+        if batch[0][0].category_id is not None
+        else None
+    )
 
     track_upscaling_factor = batch[0][0].track_upscaling_factor
 
@@ -132,6 +152,9 @@ def collate_fn(batch):
             extrs=extrs,
             query_points=query_points,
             query_points_3d=query_points_3d,
+            query_points_view=query_points_view,
+            is_background=is_background,
+            category_id=category_id,
             track_upscaling_factor=track_upscaling_factor,
             novel_video=novel_video,
             novel_intrs=novel_intrs,
