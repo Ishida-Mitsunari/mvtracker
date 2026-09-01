@@ -329,67 +329,86 @@ unset CUDA_VISIBLE_DEVICES
 Hydra: `configs/eval_nusctrack_spatrackerv2.yaml` / `eval_nusctrack_spatrackerv2_val.yaml`. Python is `/share/tgp/yangyi/envs/spatrackerv2` (not the TAPIP3D conda). Weights cache in `HF_HOME`.
 
 
-**MVTracker Kubric-pretrained fine-tune** on `nusctrack-train` (AdamW \(5\times 10^{-5}\), 7000 steps, same experiment dir auto-resumes):
+**MVTracker on NuscTrack** — fine-tune Kubric weights, train from scratch, and evaluate with the same protocol (ego 3D, fixed-metre thresholds, UniDepth queries, 384 tracks, native \(432\times 768\)). In-training eval is `nusctrack-val-max2` (2 clips) only. **Full val must use clip-sharded processes**, not Fabric DDP: `python -m mvtracker.cli.eval` with several visible GPUs does **not** shard clips, so every rank would repeat the full val.
+
+`--gpus` on the eval launcher are **physical** CUDA indices. `unset CUDA_VISIBLE_DEVICES` before eval unless those ids already match `--gpus`. Training uses Fabric DDP and **does** need `CUDA_VISIBLE_DEVICES`. Skip cards that already hold a ~20GB job; a few GB leftover on a 48GB card is fine.
+
+Configs: `configs/experiment/mvtracker_nusctrack_ft.yaml`, `configs/experiment/mvtracker_nusctrack_scratch.yaml`. `train.py` loads the latest `model_*.pth` in `experiment_path` **before** `restore_ckpt_path` — FT and scratch **must** use different directories.
+
+**Fine-tune** (load official Kubric `mvtracker_200000_june2025.pth`, AdamW \(5\times 10^{-5}\), 7000 steps). Same `experiment_path` auto-resumes:
 
 ```bash
-.venv/bin/python -m mvtracker.cli.train +experiment=mvtracker_nusctrack_ft
-# or: bash scripts/nusctrack_ft.sh
+cd /share/tgp/yangyi/mvtracker
+export PYTHONPATH=/share/tgp/yangyi/mvtracker
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+bash scripts/nusctrack_ft.sh
+# equivalent: .venv/bin/python -m mvtracker.cli.train +experiment=mvtracker_nusctrack_ft
 ```
 
-**MVTracker scratch** (no Kubric weights; AdamW \(5\times 10^{-4}\), ~64 epochs). Must use a **new** `experiment_path` — `train.py` loads the latest `.pth` in that folder before `restore_ckpt_path`. Do not start while FT still holds the GPUs.
+Checkpoints: `logs/mvtracker_nusctrack_ft/model_{step}.pth`, then `model_final.pth`.
+
+**Scratch** (no Kubric TAP weights, AdamW \(5\times 10^{-4}\), ~64 epochs). Empty `logs/mvtracker_nusctrack_scratch` (do not copy FT ckpts into it):
 
 ```bash
-.venv/bin/python -m mvtracker.cli.train +experiment=mvtracker_nusctrack_scratch
-# or: bash scripts/nusctrack_scratch.sh
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+bash scripts/nusctrack_scratch.sh
+# optional: bash scripts/nusctrack_scratch.sh trainer.num_steps=7744   # 64 * floor(973/8)
 ```
 
-In-training eval uses `nusctrack-val-max2`. After training, **full val should use clip-sharded processes** (same launcher as CoTracker). Fabric DDP (`python -m mvtracker.cli.eval` with several visible GPUs) does **not** shard clips — every rank would repeat the full val.
+Checkpoints: `logs/mvtracker_nusctrack_scratch/model_{step}.pth` and `model_final.pth`.
 
-`--gpus` are physical ids. Do not wrap `CUDA_VISIBLE_DEVICES` unless those ids already match. Skip cards still used by training.
+**Evaluate** (one process per GPU, clip-sharded). Metrics: `log-dir/nusctrack_metrics.txt`. `camera-IoU` / per-view OA are NaN (any-view vis only).
 
 ```bash
 unset CUDA_VISIBLE_DEVICES
 
-# Smoke (2 clips) on a free GPU
+# Smoke (2 clips)
 bash scripts/nusctrack_eval_mvtracker.sh \
-  --ckpt /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_ft/model_004500.pth \
-  --gpus 2 \
+  --ckpt /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_ft/model_final.pth \
+  --gpus 0 \
   --dataset nusctrack-val-max2 \
   --log-dir /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_ft_eval_max2
 
-# Full val, one independent process per GPU
+# Full val — fine-tuned
 bash scripts/nusctrack_eval_mvtracker.sh \
   --ckpt /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_ft/model_final.pth \
-  --gpus 0,1,3,4,5,6,7 \
+  --gpus 0,1,2,3,4,5,6,7 \
   --dataset nusctrack-val \
   --log-dir /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_ft_eval
 
-# Kubric zero-shot (official june2025)
+# Full val — Kubric zero-shot (official june2025, no NuscTrack FT)
 bash scripts/nusctrack_eval_mvtracker.sh \
   --ckpt /share/tgp/yangyi/mvtracker/checkpoints/mvtracker_200000_june2025.pth \
-  --gpus 0,1,3,4,5,6,7 \
+  --gpus 0,1,2,3,4,5,6,7 \
   --dataset nusctrack-val \
   --log-dir /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_zeroshot_eval
+
+# Full val — scratch
+bash scripts/nusctrack_eval_mvtracker.sh \
+  --ckpt /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_scratch/model_final.pth \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --dataset nusctrack-val \
+  --log-dir /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_scratch_eval
 ```
 
-Metrics: `log-dir/nusctrack_metrics.txt`. Single-GPU Fabric eval (`python -m mvtracker.cli.eval …`) still works if you only have one free card.
+Equivalent Python: `python -m mvtracker.cli.eval_nusctrack_parallel --model mvtracker --ckpt … --gpus … --dataset nusctrack-val --log-dir …`.
 
-**After the current FT job** (8-GPU eval FT → 8-GPU eval zero-shot → 8-GPU scratch train → 8-GPU eval scratch). Separate weight dirs and metric files. Watcher tmux: `yangyi_mvtracker_pipeline`.
+**Queued after FT** (eval FT → eval zero-shot → scratch train → eval scratch). Waits for the FT python job to exit and `model_final.pth` to exist, then uses GPUs `0–7` without waiting for leftover few-GB occupancy:
 
 ```bash
-# already started; attach with:
-tmux attach -t yangyi_mvtracker_pipeline
-# status / log:
-#   logs/nusctrack_pipeline_status.txt
-#   logs/nusctrack_pipeline_after_ft.log
+tmux new -s yangyi_mvtracker_pipeline -c /share/tgp/yangyi/mvtracker \
+  "bash scripts/nusctrack_pipeline_after_ft.sh"
+# tmux attach -t yangyi_mvtracker_pipeline
+# logs/nusctrack_pipeline_status.txt
+# logs/nusctrack_pipeline_after_ft.log
 ```
 
-| Stage | Weights | Metrics |
+| Stage | Weights | Full-val metrics |
 |---|---|---|
-| FT | `logs/mvtracker_nusctrack_ft/model_final.pth` | `logs/mvtracker_nusctrack_ft_eval/nusctrack_metrics.txt` |
+| Fine-tune | `logs/mvtracker_nusctrack_ft/model_final.pth` | `logs/mvtracker_nusctrack_ft_eval/nusctrack_metrics.txt` |
 | Zero-shot | `checkpoints/mvtracker_200000_june2025.pth` | `logs/mvtracker_nusctrack_zeroshot_eval/nusctrack_metrics.txt` |
-| Scratch train | `logs/mvtracker_nusctrack_scratch/model_*.pth` | (in-train max2 only) |
-| Scratch eval | `logs/mvtracker_nusctrack_scratch/model_final.pth` | `logs/mvtracker_nusctrack_scratch_eval/nusctrack_metrics.txt` |
+| Scratch | `logs/mvtracker_nusctrack_scratch/model_final.pth` | `logs/mvtracker_nusctrack_scratch_eval/nusctrack_metrics.txt` |
 
 
 ## Practical Considerations
