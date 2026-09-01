@@ -6,7 +6,7 @@ model:
   _target_: mvtracker.models.core.monocular_baselines.MonocularToMultiViewAdapter
   model:
     _target_: mvtracker.models.core.monocular_baselines.TAPIP3DWrapper
-    ckpt: checkpoints/tapip3d_final.pth
+    ckpt: /share/tgp/yangyi/mvtracker/checkpoints/tapip3d_final.pth
     num_iters: 6
     grid_size: 8
     resolution_factor: 1 # --> [ 384, 512 ]

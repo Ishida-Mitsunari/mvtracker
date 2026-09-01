@@ -546,6 +546,15 @@ class Evaluator:
             elapsed = end_time - start_time
             fps = frames_processed / elapsed
             logging.info(f"[Datapoint {datapoint_idx}] FPS: {fps:.1f}")
+            if datapoint_idx == 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                reserved_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
+                logging.info(
+                    "Peak CUDA memory after first clip: allocated=%.2f GiB reserved=%.2f GiB",
+                    peak_gb,
+                    reserved_gb,
+                )
             total_fps += fps
             count += 1
 

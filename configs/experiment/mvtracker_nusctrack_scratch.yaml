@@ -1,0 +1,72 @@
+# @package _global_
+# MVTracker trained from scratch on NuscTrack (no Kubric TAP weights).
+# Do NOT reuse logs/mvtracker_nusctrack_ft — train.py auto-loads the latest .pth
+# in experiment_path before restore_ckpt_path.
+# Wait until the FT job frees the GPUs, then e.g.:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
+#   python -m mvtracker.cli.train +experiment=mvtracker_nusctrack_scratch
+# Or let scripts/nusctrack_pipeline_after_ft.sh start this after FT.
+defaults:
+  - override /model: mvtracker
+
+experiment_path: /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_scratch
+restore_ckpt_path: null
+
+datasets:
+  train:
+    name: nusctrack-train
+    batch_size: 1
+    sequence_len: 24
+    traj_per_sample: 384
+    num_workers: 4
+  eval:
+    names:
+      - nusctrack-val-max2
+    num_workers: 2
+
+trainer:
+  # Default ~64 epochs at 7 GPUs / ~139 steps/epoch. The after-FT pipeline
+  # overrides this for 8 GPUs: trainer.num_steps = 64 * floor(973 / n_gpus).
+  num_steps: 8900
+  eval_freq: 2000
+  viz_freq: 2000
+  save_ckpt_freq: 500
+  lr: 0.0005
+  gamma: 0.8
+  wdecay: 0.00001
+  anneal_strategy: linear
+  grad_clip: 1.0
+  precision: bf16-mixed
+  visibility_loss_weight: 0.1
+  train_iters: 4
+  augment_train_iters: false
+
+evaluation:
+  interp_shape: null
+  predictor_settings:
+    generic:
+      visibility_threshold: 0.5
+      grid_size: 0
+      n_grids_per_view: 1
+      local_grid_size: 0
+      local_extent: 50
+      sift_size: 0
+      num_uniformly_sampled_pts: 0
+  evaluator:
+    rerun_viz_indices: null
+    forward_pass_log_indices: null
+    mp4_track_viz_indices: null
+
+augmentations:
+  probability: 0
+
+modes:
+  validate_at_start: false
+  do_initial_static_pretrain: false
+  pretrain_only: false
+  eval_only: false
+  debug: false
+
+logging:
+  log_wandb: false
+  tags: ["nusctrack", "scratch"]

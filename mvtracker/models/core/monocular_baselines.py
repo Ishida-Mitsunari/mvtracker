@@ -120,7 +120,26 @@ class SpaTrackerV2Wrapper(nn.Module):
     ):
         super(SpaTrackerV2Wrapper, self).__init__()
 
-        sys.path.append("../spatialtrackerv2/")
+        spatrack_root = os.environ.get("SPATRACKERV2_ROOT", "/share/tgp/yangyi/spatialtrackerv2")
+        if spatrack_root not in sys.path:
+            sys.path.insert(0, spatrack_root)
+        import utils3d
+
+        def _spatrack_depth_edge(depth, rtol=None, atol=None, mask=None, **kwargs):
+            # Current utils3d renamed depth_edge -> depth_map_edge and @batched(2)
+            # treats the last two dims as H,W. SpaTrackerV2 still passes (B,1,H,W);
+            # leaving the channel in the batch dims broadcasts to (B,B,B,H,W).
+            squeeze_c = depth.ndim == 4 and depth.shape[1] == 1
+            if squeeze_c:
+                depth = depth[:, 0]
+                if mask is not None and mask.ndim == 4 and mask.shape[1] == 1:
+                    mask = mask[:, 0]
+            edge = utils3d.torch.depth_map_edge(depth, rtol=rtol, atol=atol, mask=mask, **kwargs)
+            if squeeze_c:
+                edge = edge[:, None]
+            return edge
+
+        utils3d.torch.depth_edge = _spatrack_depth_edge
         from models.SpaTrackV2.models.predictor import Predictor
         if model_type == "offline":
             self.model = Predictor.from_pretrained("Yuxihenry/SpatialTrackerV2-Offline")
@@ -426,7 +445,19 @@ class TAPIP3DWrapper(nn.Module):
         self.resolution_factor = resolution_factor
         self.transform_to_camera_space = transform_to_camera_space
 
-        sys.path.append("../tapip3d")
+        tapip3d_root = os.environ.get("TAPIP3D_ROOT", "/share/tgp/yangyi/tapip3d")
+        if tapip3d_root not in sys.path:
+            sys.path.insert(0, tapip3d_root)
+        # CoTrackerCNNEncoder would torch.hub.load facebook/co-tracker just to
+        # init fnet; TAPIP3D's checkpoint then overwrites those weights.
+        import models.encoders.cotracker_cnn as _tapip_cnn
+
+        _orig_enc_init = _tapip_cnn.CoTrackerCNNEncoder.__init__
+
+        def _init_without_hub(self, resolution, output_dim, stride, pretrained, freeze_mode):
+            return _orig_enc_init(self, resolution, output_dim, stride, False, freeze_mode)
+
+        _tapip_cnn.CoTrackerCNNEncoder.__init__ = _init_without_hub
         from utils.inference_utils import load_model
         self.model = load_model(ckpt)
         self.model.cuda()
