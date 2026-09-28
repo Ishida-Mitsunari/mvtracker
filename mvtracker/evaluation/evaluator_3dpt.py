@@ -561,6 +561,7 @@ class Evaluator:
             pred_trajectories = results["traj_e"]
             pred_visibilities = results["vis_e"]
             pred_trajectories_2d = results["traj2d_e"] if "traj2d_e" in results else None
+            pred_visibilities_per_cam = results.get("vis_e_per_cam")
             assert "strided" not in dataset_name, "Strided evaluation is not supported yet."
 
             # Determine the evaluation setting
@@ -750,7 +751,11 @@ class Evaluator:
                 valid_np = valid_tracks_per_frame[0]
                 # Datapoint vis is (V, T, N) -> protocol (T, N, K)
                 gt_vis_tnk = gt_visibilities_per_view[0].permute(1, 2, 0)
-                pred_vis_tn = pred_visibilities[0]
+                # Prefer learned per-cam vis when present; else any-view (T, N).
+                if pred_visibilities_per_cam is not None:
+                    pred_vis_tn = pred_visibilities_per_cam[0]
+                else:
+                    pred_vis_tn = pred_visibilities[0]
                 qf = query_points_3d[0, :, 0]
                 is_bg = getattr(datapoint, "is_background", None)
                 if is_bg is not None:

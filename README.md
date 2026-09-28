@@ -333,7 +333,9 @@ Hydra: `configs/eval_nusctrack_spatrackerv2.yaml` / `eval_nusctrack_spatrackerv2
 
 `--gpus` on the eval launcher are **physical** CUDA indices. `unset CUDA_VISIBLE_DEVICES` before eval unless those ids already match `--gpus`. Training uses Fabric DDP and **does** need `CUDA_VISIBLE_DEVICES`. Skip cards that already hold a ~20GB job; a few GB leftover on a 48GB card is fine.
 
-Configs: `configs/experiment/mvtracker_nusctrack_ft.yaml`, `configs/experiment/mvtracker_nusctrack_scratch.yaml`. `train.py` loads the latest `model_*.pth` in `experiment_path` **before** `restore_ckpt_path` — FT and scratch **must** use different directories.
+Configs: `configs/experiment/mvtracker_nusctrack_ft.yaml`, `configs/experiment/mvtracker_nusctrack_scratch.yaml`, `configs/experiment/mvtracker_nusctrack_scratch_percam_vis.yaml`. `train.py` loads the latest `model_*.pth` in `experiment_path` **before** `restore_ckpt_path` — FT, scratch, and per-cam scratch **must** use different directories.
+
+Per-camera visibility is **off by default** (`model.predict_per_cam_visibility: false`), so Kubric / FT / any-view scratch commands are unchanged. When enabled, the model also predicts `(T, N, 6)` vis (same cam order as BEVTracker) and NuscTrack eval fills `camera-IoU` / per-view OA.
 
 **Fine-tune** (load official Kubric `mvtracker_200000_june2025.pth`, AdamW \(5\times 10^{-5}\), 7000 steps). Same `experiment_path` auto-resumes:
 
@@ -358,7 +360,16 @@ bash scripts/nusctrack_scratch.sh
 
 Checkpoints: `logs/mvtracker_nusctrack_scratch/model_{step}.pth` and `model_final.pth`.
 
-**Evaluate** (one process per GPU, clip-sharded). Metrics: `log-dir/nusctrack_metrics.txt`. `camera-IoU` / per-view OA are NaN (any-view vis only).
+**Scratch + per-camera visibility** (no Kubric weights; additive 6-cam vis head; ~64 epochs on 6 GPUs). Empty `logs/mvtracker_nusctrack_scratch_percam_vis`:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+bash scripts/nusctrack_scratch_percam_vis.sh
+```
+
+Checkpoints: `logs/mvtracker_nusctrack_scratch_percam_vis/model_{step}.pth` (saved every ~epoch) and `model_final.pth`. Eval with the same `nusctrack_eval_mvtracker.sh` pointing at that ckpt; `camera-IoU` / per-view OA are populated.
+
+**Evaluate** (one process per GPU, clip-sharded). Metrics: `log-dir/nusctrack_metrics.txt`. With the default any-view model, `camera-IoU` / per-view OA are NaN; with `predict_per_cam_visibility=true` they are filled.
 
 ```bash
 unset CUDA_VISIBLE_DEVICES

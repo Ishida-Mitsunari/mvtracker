@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Visualize CoTracker3 on one NuscTrack clip (CAM_FRONT 2D + ego 3D).
+"""Visualize MVTracker (FT / zero-shot) on NuscTrack clips (CAM_FRONT + ego 3D).
 
-Runs the same eval pipeline as ``eval_nusctrack_parallel`` (per-query-cam
-CoTracker3 + UniDepth lift). Draws only tracks whose query camera is CAM_FRONT.
+Same drawing style as ``viz_nusctrack_cotracker3.py``. Model loading matches
+``eval_nusctrack_parallel --model mvtracker``.
 
-Outputs under ``--out-dir``:
-  cam_front_native2d_gt.mp4 / _pred.mp4 / _overlay.mp4
-  cam_front_proj3d_overlay.mp4
-  tracks_3d.mp4, tracks_bev.mp4
-  summary.png
-  tracks.npz
+Example::
+
+  CUDA_VISIBLE_DEVICES=7 .venv/bin/python scripts/viz_nusctrack_mvtracker.py \\
+    --seqs scene-0780_later,scene-0929_later,scene-1060_later \\
+    --ckpt logs/mvtracker_nusctrack_ft/model_final.pth \\
+    --out-dir /share/tgp/yangyi/vis/failure_candidates/viz_mv_ft
 """
 from __future__ import annotations
 
@@ -29,11 +29,8 @@ from matplotlib.figure import Figure
 
 from mvtracker.datasets.nusctrack_dataset import CAM_TO_IDX, CAMERAS, NuscTrackDataset
 from mvtracker.models.core.model_utils import world_space_to_pixel_xy_and_camera_z
-from mvtracker.models.core.monocular_baselines import (
-    CoTrackerOfflineWrapper,
-    MonocularToMultiViewAdapter,
-)
 from mvtracker.models.evaluation_predictor_3dpt import EvaluationPredictor
+from mvtracker.cli.eval_nusctrack_parallel import _build_mvtracker, _predictor_kwargs
 
 CAM_FRONT = "CAM_FRONT"
 CAM_FRONT_IDX = CAM_TO_IDX[CAM_FRONT]
@@ -47,17 +44,22 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--seqs",
-        default="",
+        default="scene-0780_later,scene-0929_later,scene-1060_later",
         help="Comma-separated seq_name list (overrides --scene/--half)",
     )
-    p.add_argument("--scene", default="scene-0003")
-    p.add_argument("--half", default="former", choices=["former", "later", "both"])
+    p.add_argument("--scene", default="", help="Legacy single-scene mode")
+    p.add_argument("--half", default="later", choices=["former", "later", "both"])
     p.add_argument("--dataset", default="nusctrack-val")
     p.add_argument("--dataset-root", default="/share/tgp/yangyi/nuscenes")
     p.add_argument(
-        "--out-dir",
-        default="/share/tgp/yangyi/mvtracker/logs/cotracker3_offline_nusctrack_val/viz",
+        "--ckpt",
+        default="/share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_ft/model_final.pth",
     )
+    p.add_argument(
+        "--out-dir",
+        default="/share/tgp/yangyi/vis/failure_candidates/viz_mv_ft",
+    )
+    p.add_argument("--tag", default="MVTracker-FT", help="Banner / summary label")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--max-instance", type=int, default=24)
     p.add_argument("--max-background", type=int, default=12)
@@ -459,7 +461,11 @@ def run_clip(args, dataset, predictor, device, seq_name=None, half=None):
     pred_vis = _to_np(results["vis_e"])[0][:, keep]
     if pred_vis.dtype != bool:
         pred_vis = pred_vis >= 0.5
-    pred_xy_native = _to_np(results["traj2d_e"])[0][:, keep]  # T,N,2  tensor res
+    # MVTracker returns ego-3D only; monocular baselines also expose traj2d_e.
+    has_native_2d = "traj2d_e" in results and results["traj2d_e"] is not None
+    pred_xy_native = (
+        _to_np(results["traj2d_e"])[0][:, keep] if has_native_2d else None
+    )
 
     gt_xyz = _to_np(datapoint.trajectory_3d)[:, keep]
     gt_valid = _to_np(datapoint.valid)[:, keep].astype(bool)
@@ -474,7 +480,6 @@ def run_clip(args, dataset, predictor, device, seq_name=None, half=None):
     _, T, _, H, W = datapoint.video.shape
     after_q = np.arange(T)[:, None] >= query_t[None, :]
 
-    # Native 2D: CoTracker pixels in tensor resolution, OOB = invisible
     def in_image(xy, h, w):
         return (
             np.isfinite(xy).all(-1)
@@ -483,9 +488,6 @@ def run_clip(args, dataset, predictor, device, seq_name=None, half=None):
             & (xy[..., 1] >= 0)
             & (xy[..., 1] < h)
         )
-
-    vis_pred_2d = pred_vis & after_q & in_image(pred_xy_native, H, W)
-    vis_gt_2d = gt_vis_front & gt_valid & after_q & in_image(gt_xy_native, H, W)
 
     orig_rgb, K_orig = load_cam_front_orig(dataset, clip)
     H0, W0 = orig_rgb.shape[1], orig_rgb.shape[2]
@@ -497,45 +499,73 @@ def run_clip(args, dataset, predictor, device, seq_name=None, half=None):
         out[..., 1] *= sy
         return out
 
-    xy_gt_orig = scale_xy(gt_xy_native)
-    xy_pr_orig = scale_xy(pred_xy_native)
-    vis_pred_2d_orig = pred_vis & after_q & in_image(xy_pr_orig, H0, W0)
-    vis_gt_2d_orig = gt_vis_front & gt_valid & after_q & in_image(xy_gt_orig, H0, W0)
-
     extr_front = _to_np(datapoint.extrs)[CAM_FRONT_IDX]  # T,3,4
     xy_gt_proj, fov_gt = project_ego(gt_xyz, K_orig, extr_front, args.min_cam_z, H0, W0)
     xy_pr_proj, fov_pr = project_ego(pred_xyz, K_orig, extr_front, args.min_cam_z, H0, W0)
     vis_gt_proj = gt_valid & after_q & fov_gt
-    vis_pr_proj = after_q & fov_pr & np.isfinite(pred_xyz).all(-1)
+    vis_pr_proj = after_q & fov_pr & np.isfinite(pred_xyz).all(-1) & pred_vis
 
     colors_bgr, _ = rainbow_colors(keep.size)
     out_dir = Path(args.out_dir) / clip["seq_name"]
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gt_native = put_banner(
-        draw_tracks_on_rgb(orig_rgb, xy_gt_orig, vis_gt_2d_orig, colors_bgr, args.leave_trace, query_t=query_t),
-        "{}  CAM_FRONT  GT native 2D  (N={})".format(clip["seq_name"], keep.size),
-    )
-    pr_native = put_banner(
-        draw_tracks_on_rgb(orig_rgb, xy_pr_orig, vis_pred_2d_orig, colors_bgr, args.leave_trace, query_t=query_t),
-        "{}  CAM_FRONT  CoTracker3 native 2D".format(clip["seq_name"]),
-    )
-    overlay_native = put_banner(
-        draw_overlay_gt_pred(
-            orig_rgb, xy_gt_orig, vis_gt_2d_orig, xy_pr_orig, vis_pred_2d_orig, args.leave_trace, query_t
-        ),
-        "{}  CAM_FRONT native 2D   GT=green  Pred=red".format(clip["seq_name"]),
-    )
+    if has_native_2d:
+        xy_gt_orig = scale_xy(gt_xy_native)
+        xy_pr_orig = scale_xy(pred_xy_native)
+        vis_pred_2d_orig = pred_vis & after_q & in_image(xy_pr_orig, H0, W0)
+        vis_gt_2d_orig = gt_vis_front & gt_valid & after_q & in_image(xy_gt_orig, H0, W0)
+        gt_native = put_banner(
+            draw_tracks_on_rgb(
+                orig_rgb, xy_gt_orig, vis_gt_2d_orig, colors_bgr, args.leave_trace, query_t=query_t
+            ),
+            "{}  CAM_FRONT  GT native 2D  (N={})".format(clip["seq_name"], keep.size),
+        )
+        pr_native = put_banner(
+            draw_tracks_on_rgb(
+                orig_rgb, xy_pr_orig, vis_pred_2d_orig, colors_bgr, args.leave_trace, query_t=query_t
+            ),
+            "{}  CAM_FRONT  {} native 2D".format(clip["seq_name"], args.tag),
+        )
+        overlay_native = put_banner(
+            draw_overlay_gt_pred(
+                orig_rgb,
+                xy_gt_orig,
+                vis_gt_2d_orig,
+                xy_pr_orig,
+                vis_pred_2d_orig,
+                args.leave_trace,
+                query_t,
+            ),
+            "{}  CAM_FRONT native 2D   GT=green  Pred=red".format(clip["seq_name"]),
+        )
+        write_mp4(
+            out_dir / "cam_front_native2d_gt_vs_pred.mp4",
+            hstack_videos(gt_native, pr_native),
+            args.fps,
+        )
+        write_mp4(out_dir / "cam_front_native2d_overlay.mp4", overlay_native, args.fps)
+    else:
+        # For MVTracker, use 3D→CAM_FRONT projection as the primary 2D overlay.
+        overlay_native = put_banner(
+            draw_overlay_gt_pred(
+                orig_rgb,
+                xy_gt_proj,
+                vis_gt_proj,
+                xy_pr_proj,
+                vis_pr_proj,
+                args.leave_trace,
+                query_t,
+            ),
+            "{}  CAM_FRONT 3D→2D  GT=green Pred=red".format(clip["seq_name"]),
+        )
+        write_mp4(out_dir / "cam_front_overlay.mp4", overlay_native, args.fps)
+
     overlay_proj = put_banner(
         draw_overlay_gt_pred(
             orig_rgb, xy_gt_proj, vis_gt_proj, xy_pr_proj, vis_pr_proj, args.leave_trace, query_t
         ),
-        "{}  CAM_FRONT 3D projected   GT=green  Pred=red (UniDepth lift)".format(clip["seq_name"]),
+        "{}  CAM_FRONT 3D projected   GT=green  Pred=red".format(clip["seq_name"]),
     )
-
-    side_native = hstack_videos(gt_native, pr_native)
-    write_mp4(out_dir / "cam_front_native2d_gt_vs_pred.mp4", side_native, args.fps)
-    write_mp4(out_dir / "cam_front_native2d_overlay.mp4", overlay_native, args.fps)
     write_mp4(out_dir / "cam_front_proj3d_overlay.mp4", overlay_proj, args.fps)
 
     xyz_vid = render_3d_frames(gt_xyz, pred_xyz, gt_valid & after_q, query_t, args.leave_trace, mode="3d")
@@ -545,9 +575,9 @@ def run_clip(args, dataset, predictor, device, seq_name=None, half=None):
 
     mid = T // 2
     last = T - 1
-    cv2.imwrite(str(out_dir / "cam_front_native2d_overlay_t{:02d}.png".format(mid)), cv2.cvtColor(overlay_native[mid], cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(out_dir / "cam_front_overlay_t{:02d}.png".format(mid)), cv2.cvtColor(overlay_native[mid], cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(out_dir / "cam_front_proj3d_overlay_t{:02d}.png".format(mid)), cv2.cvtColor(overlay_proj[mid], cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(out_dir / "cam_front_native2d_overlay_last.png"), cv2.cvtColor(overlay_native[last], cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(out_dir / "cam_front_overlay_last.png"), cv2.cvtColor(overlay_native[last], cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(out_dir / "cam_front_proj3d_overlay_last.png"), cv2.cvtColor(overlay_proj[last], cv2.COLOR_RGB2BGR))
 
     render_summary_png(
@@ -556,7 +586,8 @@ def run_clip(args, dataset, predictor, device, seq_name=None, half=None):
         overlay_proj[mid],
         bev_vid[mid],
         xyz_vid[mid],
-        "CoTracker3 + UniDepth  |  {}  |  CAM_FRONT queries  |  inst {} / bg {}".format(
+        "{} + UniDepth depth  |  {}  |  CAM_FRONT queries  |  inst {} / bg {}".format(
+            args.tag,
             clip["seq_name"],
             int((~is_bg_draw).sum()),
             int(is_bg_draw.sum()),
@@ -571,11 +602,13 @@ def run_clip(args, dataset, predictor, device, seq_name=None, half=None):
         is_background=is_bg_draw,
         pred_xyz=pred_xyz,
         pred_vis=pred_vis,
-        pred_xy_native=pred_xy_native,
+        pred_xy_native=pred_xy_native if pred_xy_native is not None else np.array([]),
         gt_xyz=gt_xyz,
         gt_valid=gt_valid,
         gt_vis_front=gt_vis_front,
         gt_xy_native=gt_xy_native,
+        xy_gt_proj=xy_gt_proj,
+        xy_pr_proj=xy_pr_proj,
     )
     print("Wrote", out_dir)
     return out_dir
@@ -588,21 +621,11 @@ def main():
     device = torch.device("cuda:0")
     dataset = NuscTrackDataset.from_name(args.dataset, args.dataset_root)
 
-    print("Loading CoTracker3 …")
-    inner = CoTrackerOfflineWrapper(model_name="cotracker3_offline", grid_size=10)
-    model = MonocularToMultiViewAdapter(inner).to(device).eval()
+    print("Loading MVTracker from", args.ckpt)
+    model = _build_mvtracker(args.ckpt).to(device).eval()
     predictor = EvaluationPredictor(
         multiview_model=model,
-        interp_shape=None,
-        visibility_threshold=0.5,
-        grid_size=0,
-        n_grids_per_view=1,
-        local_grid_size=0,
-        local_extent=50,
-        single_point=False,
-        sift_size=0,
-        num_uniformly_sampled_pts=0,
-        n_iters=4,
+        **_predictor_kwargs("mvtracker"),
     )
 
     seqs = [s.strip() for s in args.seqs.split(",") if s.strip()]

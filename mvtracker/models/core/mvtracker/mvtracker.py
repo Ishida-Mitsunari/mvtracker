@@ -111,12 +111,16 @@ class MVTracker(nn.Module):
             corr_add_neighbor_offset=True,
             corr_add_neighbor_xyz=False,
             corr_filter_invalid_depth=False,
+            predict_per_cam_visibility=False,
+            num_cams=6,
     ):
         super().__init__()
 
         self.S = sliding_window_len
         self.stride = stride
         self.normalize_scene_in_fwd_pass = normalize_scene_in_fwd_pass
+        self.predict_per_cam_visibility = bool(predict_per_cam_visibility)
+        self.num_cams = int(num_cams)
         self.latent_dim = fmaps_dim
         self.flow_embed_dim = 64
         self.b_latent_dim = self.latent_dim // 3
@@ -179,6 +183,14 @@ class MVTracker(nn.Module):
         self.ffeats_norm = nn.GroupNorm(1, self.latent_dim)
         self.ffeats_updater = nn.Sequential(nn.Linear(self.latent_dim, self.latent_dim), nn.GELU())
         self.vis_predictor = nn.Sequential(nn.Linear(self.latent_dim, 1))
+        # Optional 6-cam head (NuscTrack camera-IoU). Off by default so Kubric /
+        # FT / old scratch checkpoints and any-view eval stay unchanged.
+        if self.predict_per_cam_visibility:
+            self.vis_predictor_per_cam = nn.Sequential(
+                nn.Linear(self.latent_dim, self.num_cams)
+            )
+        else:
+            self.vis_predictor_per_cam = None
 
         self.stats_pyramid = None
         self.stats_depth = None
@@ -419,8 +431,13 @@ class MVTracker(nn.Module):
             coord_predictions.append(coords.clone())
 
         vis_e = self.vis_predictor(ffeats.reshape(B * S * N, self.latent_dim)).reshape(B, S, N)
+        vis_e_per_cam = None
+        if self.vis_predictor_per_cam is not None:
+            vis_e_per_cam = self.vis_predictor_per_cam(
+                ffeats.reshape(B * S * N, self.latent_dim)
+            ).reshape(B, S, N, self.num_cams)
 
-        return coord_predictions, vis_e, feat_init
+        return coord_predictions, vis_e, feat_init, vis_e_per_cam
 
     def forward(
             self,
@@ -540,10 +557,16 @@ class MVTracker(nn.Module):
         # Placeholders for the results (for the sorted points)
         traj_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points, 3))
         vis_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points))
+        vis_e_per_cam_ = None
+        if self.predict_per_cam_visibility:
+            vis_e_per_cam_ = coords_init_.new_zeros(
+                (batch_size, num_frames, num_points, self.num_cams)
+            )
 
         w_idx_start = query_points_t_.min()
         p_idx_start = 0
         vis_predictions = []
+        vis_predictions_per_cam = []
         coord_predictions = []
         p_idx_end_list = []
         fmaps_seq, depths_seq, feat_init, rerun_fmap_coloring_fn = None, None, None, None
@@ -674,7 +697,7 @@ class MVTracker(nn.Module):
                     track_mask_current[:, -1:].repeat(1, self.S - S_local, 1, 1),
                 ], 1)
 
-            coords, vis, _ = self.forward_iteration(
+            coords, vis, _, vis_per_cam = self.forward_iteration(
                 fmaps=fmaps_seq,
                 depths=depths_seq,
                 intrs=intrs_seq,
@@ -701,9 +724,15 @@ class MVTracker(nn.Module):
                     for coord in coords
                 ])
                 vis_predictions.append(vis[:, :S_local])
+                if vis_per_cam is not None:
+                    vis_predictions_per_cam.append(vis_per_cam[:, :S_local])
 
             traj_e_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = coords[-1][:, :S_local]
             vis_e_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = torch.sigmoid(vis[:, :S_local])
+            if vis_e_per_cam_ is not None and vis_per_cam is not None:
+                vis_e_per_cam_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = torch.sigmoid(
+                    vis_per_cam[:, :S_local]
+                )
 
             track_mask_[:, : w_idx_start + self.S, :p_idx_end] = 0.0
             w_idx_start = w_idx_start + self.S // 2
@@ -733,8 +762,10 @@ class MVTracker(nn.Module):
             "feat_init": feat_init,
             "vis_e": vis_e,
         }
+        if vis_e_per_cam_ is not None:
+            results["vis_e_per_cam"] = vis_e_per_cam_[:, :, inv_sort_inds]
         if self.is_train:
-            results["train_data"] = {
+            train_data = {
                 "vis_predictions": vis_predictions,
                 "coord_predictions": coord_predictions,
                 "attn_predictions": None,
@@ -742,6 +773,9 @@ class MVTracker(nn.Module):
                 "sort_inds": sort_inds,
                 "Rigid_ln_total": None,
             }
+            if vis_predictions_per_cam:
+                train_data["vis_predictions_per_cam"] = vis_predictions_per_cam
+            results["train_data"] = train_data
         return results
 
 

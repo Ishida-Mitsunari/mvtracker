@@ -1,0 +1,74 @@
+# @package _global_
+# MVTracker from-scratch on NuscTrack with per-camera visibility head.
+# Isolated from logs/mvtracker_nusctrack_scratch so train.py does not auto-load
+# the previous any-view scratch checkpoints.
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/nusctrack_scratch_percam_vis.sh
+defaults:
+  - override /model: mvtracker
+
+experiment_path: /share/tgp/yangyi/mvtracker/logs/mvtracker_nusctrack_scratch_percam_vis
+restore_ckpt_path: null
+
+model:
+  predict_per_cam_visibility: true
+  num_cams: 6
+
+datasets:
+  train:
+    name: nusctrack-train
+    batch_size: 1
+    sequence_len: 24
+    traj_per_sample: 384
+    num_workers: 4
+  eval:
+    names:
+      - nusctrack-val-max2
+    num_workers: 2
+
+trainer:
+  # ~64 epochs at 6 GPUs. DistributedSampler length is ceil(N_train/6);
+  # NuscTrack train is ~1400 clips → 234 steps/epoch (not the older 973 estimate).
+  num_steps: 14976
+  eval_freq: 2000
+  viz_freq: 2000
+  save_ckpt_freq: 234
+  lr: 0.0005
+  gamma: 0.8
+  wdecay: 0.00001
+  anneal_strategy: linear
+  grad_clip: 1.0
+  precision: bf16-mixed
+  visibility_loss_weight: 0.1
+  per_cam_visibility_loss_weight: 1.0
+  train_iters: 4
+  augment_train_iters: false
+
+evaluation:
+  interp_shape: null
+  predictor_settings:
+    generic:
+      visibility_threshold: 0.5
+      grid_size: 0
+      n_grids_per_view: 1
+      local_grid_size: 0
+      local_extent: 50
+      sift_size: 0
+      num_uniformly_sampled_pts: 0
+  evaluator:
+    rerun_viz_indices: null
+    forward_pass_log_indices: null
+    mp4_track_viz_indices: null
+
+augmentations:
+  probability: 0
+
+modes:
+  validate_at_start: false
+  do_initial_static_pretrain: false
+  pretrain_only: false
+  eval_only: false
+  debug: false
+
+logging:
+  log_wandb: false
+  tags: ["nusctrack", "scratch", "percam_vis"]

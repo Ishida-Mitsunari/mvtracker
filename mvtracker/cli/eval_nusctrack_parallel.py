@@ -65,6 +65,20 @@ METHOD_HEADERS = {
         "depth: UniDepthV2 (camera Z, lifted with the same K / cam2ego as the video)",
         "interp_shape: native 432x768 (no Kubric 384x512 resize)",
     ],
+    "surround_tap": [
+        "method: SurroundTAP (MVTracker fine kNN + coarse depth-splat BEV)",
+        "pipeline: 6-view RGB-D, UniDepthV2 as input depth, queries lifted to ego 3D",
+        "depth: UniDepthV2 (camera Z, lifted with the same K / cam2ego as the video)",
+        "interp_shape: native 432x768 (no Kubric 384x512 resize)",
+        "bev: depth-splat ego-XY (res=1.6m), fuse=add into kNN LRR",
+    ],
+    "surround_tap_v1": [
+        "method: SurroundTAP v1 (MVTracker kNN + staged coarse BEV XY attention)",
+        "pipeline: 6-view RGB-D, UniDepthV2 as input depth, queries lifted to ego 3D",
+        "depth: UniDepthV2 (camera Z, lifted with the same K / cam2ego as the video)",
+        "interp_shape: native 432x768 (no Kubric 384x512 resize)",
+        "bev: pyramid splat 1.6+0.8m, local 9x9 attn -> gated dXY, then kNN",
+    ],
 }
 
 
@@ -90,6 +104,12 @@ def _mvtracker_state_dict(ckpt_path: str):
 def _build_mvtracker(ckpt_path: str):
     from mvtracker.models.core.mvtracker.mvtracker import MVTracker
 
+    state, total_steps = _mvtracker_state_dict(ckpt_path)
+    if state and next(iter(state)).startswith("module."):
+        state = {k[len("module.") :]: v for k, v in state.items()}
+    # Old any-view checkpoints have no per-cam head. Enable it only when the
+    # weights are present so Kubric / FT / scratch eval stays strict and unchanged.
+    predict_per_cam = any(k.startswith("vis_predictor_per_cam.") for k in state)
     # Must match configs/model/mvtracker.yaml (hidden_size=256, not the class default 384).
     model = MVTracker(
         sliding_window_len=12,
@@ -109,15 +129,106 @@ def _build_mvtracker(ckpt_path: str):
         corr_add_neighbor_offset=True,
         corr_add_neighbor_xyz=False,
         corr_filter_invalid_depth=False,
+        predict_per_cam_visibility=predict_per_cam,
+        num_cams=6,
     )
-    state, total_steps = _mvtracker_state_dict(ckpt_path)
     missing, unexpected = model.load_state_dict(state, strict=True)
     logging.info(
-        "Loaded MVTracker from %s (total_steps=%s, missing=%s, unexpected=%s)",
+        "Loaded MVTracker from %s (total_steps=%s, per_cam_vis=%s, missing=%s, unexpected=%s)",
         ckpt_path,
         total_steps,
+        predict_per_cam,
         len(missing),
         len(unexpected),
+    )
+    return model
+
+
+def _build_surround_tap(ckpt_path: str):
+    from mvtracker.models.core.surround_tap.surround_tap import SurroundTAP
+
+    # Must match configs/model/surround_tap.yaml.
+    model = SurroundTAP(
+        sliding_window_len=12,
+        stride=4,
+        normalize_scene_in_fwd_pass=False,
+        fmaps_dim=128,
+        add_space_attn=True,
+        num_heads=6,
+        hidden_size=256,
+        space_depth=6,
+        time_depth=6,
+        num_virtual_tracks=64,
+        use_flash_attention=True,
+        corr_n_groups=1,
+        corr_n_levels=4,
+        corr_neighbors=16,
+        corr_add_neighbor_offset=True,
+        corr_add_neighbor_xyz=False,
+        corr_filter_invalid_depth=False,
+        bev_x_min=-51.2,
+        bev_x_max=51.2,
+        bev_y_min=-51.2,
+        bev_y_max=51.2,
+        bev_resolution=1.6,
+        bev_corr_radius=3,
+        bev_fuse="add",
+    )
+    state, total_steps = _mvtracker_state_dict(ckpt_path)
+    # Fabric may wrap keys with "module."; strip if present.
+    if state and next(iter(state)).startswith("module."):
+        state = {k[len("module.") :]: v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    logging.info(
+        "Loaded SurroundTAP from %s (total_steps=%s, missing=%s, unexpected=%s)",
+        ckpt_path,
+        total_steps,
+        missing,
+        unexpected,
+    )
+    return model
+
+
+def _build_surround_tap_v1(ckpt_path: str):
+    from mvtracker.models.core.surround_tap.surround_tap_v1 import SurroundTAPV1
+
+    model = SurroundTAPV1(
+        sliding_window_len=12,
+        stride=4,
+        normalize_scene_in_fwd_pass=False,
+        fmaps_dim=128,
+        add_space_attn=True,
+        num_heads=6,
+        hidden_size=256,
+        space_depth=6,
+        time_depth=6,
+        num_virtual_tracks=64,
+        use_flash_attention=True,
+        corr_n_groups=1,
+        corr_n_levels=4,
+        corr_neighbors=16,
+        corr_add_neighbor_offset=True,
+        corr_add_neighbor_xyz=False,
+        corr_filter_invalid_depth=False,
+        bev_x_min=-51.2,
+        bev_x_max=51.2,
+        bev_y_min=-51.2,
+        bev_y_max=51.2,
+        bev_resolutions=(1.6, 0.8),
+        bev_corr_radius=4,
+        coarse_detach=True,
+        coarse_attn_heads=4,
+    )
+    state, total_steps = _mvtracker_state_dict(ckpt_path)
+    if state and next(iter(state)).startswith("module."):
+        state = {k[len("module.") :]: v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    logging.info(
+        "Loaded SurroundTAPV1 from %s (total_steps=%s, missing=%s, unexpected=%s)",
+        ckpt_path,
+        total_steps,
+        missing,
+        unexpected,
     )
     return model
 
@@ -135,6 +246,16 @@ def _build_model(method: str, ckpt: str | None = None):
             raise ValueError("--ckpt is required for --model mvtracker")
         logging.info("Loading MVTracker weights from %s", ckpt)
         return _build_mvtracker(ckpt)
+    if method == "surround_tap":
+        if not ckpt:
+            raise ValueError("--ckpt is required for --model surround_tap")
+        logging.info("Loading SurroundTAP weights from %s", ckpt)
+        return _build_surround_tap(ckpt)
+    if method == "surround_tap_v1":
+        if not ckpt:
+            raise ValueError("--ckpt is required for --model surround_tap_v1")
+        logging.info("Loading SurroundTAP v1 weights from %s", ckpt)
+        return _build_surround_tap_v1(ckpt)
     if method == "cotracker3":
         logging.info("Loading CoTracker3 offline weights")
         inner = CoTrackerOfflineWrapper(model_name="cotracker3_offline", grid_size=10)
@@ -372,11 +493,13 @@ def main():
     parser.add_argument(
         "--ckpt",
         default=None,
-        help="Weight path for --model mvtracker (official june2025 or Fabric model_*.pth).",
+        help="Weight path for --model mvtracker|surround_tap|surround_tap_v1.",
     )
     args = parser.parse_args()
     if args.model == "mvtracker" and not args.ckpt:
         args.ckpt = DEFAULT_MVTRACKER_CKPT
+    if args.model in ("surround_tap", "surround_tap_v1") and not args.ckpt:
+        raise ValueError(f"--ckpt is required for --model {args.model}")
 
     gpus = _parse_gpus(args.gpus)
     world_size = len(gpus)

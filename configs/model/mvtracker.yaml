@@ -21,6 +21,9 @@ model:
   corr_add_neighbor_offset: true
   corr_add_neighbor_xyz: false
   corr_filter_invalid_depth: false   # slower, but would make sure points with invalid depth are not considered in corr
+  # NuscTrack per-camera visibility head. Default off: any-view only (old experiments).
+  predict_per_cam_visibility: false
+  num_cams: 6
 
 evaluation:
   interp_shape: [ 384, 512 ]

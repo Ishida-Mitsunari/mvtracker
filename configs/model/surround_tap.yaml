@@ -1,0 +1,49 @@
+# @package _global_
+# SurroundTAP = MVTracker fine kNN + coarse depth-splat BEV.
+# Does NOT replace default model. Enable with:
+#   +experiment=... override /model: surround_tap
+# or scripts/smoke_surround_tap_forward.py
+defaults:
+  - default
+
+model:
+  _target_: mvtracker.models.core.surround_tap.surround_tap.SurroundTAP
+  sliding_window_len: 12
+  stride: 4
+  normalize_scene_in_fwd_pass: false
+  fmaps_dim: 128
+  add_space_attn: true
+  num_heads: 6
+  hidden_size: 256
+  space_depth: 6
+  time_depth: 6
+  num_virtual_tracks: 64
+  use_flash_attention: true
+  corr_n_groups: 1
+  corr_n_levels: 4
+  corr_neighbors: 16
+  corr_add_neighbor_offset: true
+  corr_add_neighbor_xyz: false
+  corr_filter_invalid_depth: false
+  bev_x_min: -51.2
+  bev_x_max: 51.2
+  bev_y_min: -51.2
+  bev_y_max: 51.2
+  bev_resolution: 1.6
+  bev_corr_radius: 3
+  bev_fuse: add
+
+evaluation:
+  interp_shape: null
+  predictor_settings:
+    generic:
+      visibility_threshold: 0.5
+      grid_size: 0
+      n_grids_per_view: 1
+      local_grid_size: 0
+      local_extent: 50
+      sift_size: 0
+      num_uniformly_sampled_pts: 0
+
+trainer:
+  precision: bf16-mixed

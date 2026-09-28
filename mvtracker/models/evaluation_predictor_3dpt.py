@@ -214,6 +214,12 @@ class EvaluationPredictor(torch.nn.Module):
 
             traj_e = torch.zeros((batch_size, num_frames, num_points, 3), device=rgbs.device)
             vis_e = torch.zeros((batch_size, num_frames, num_points), device=rgbs.device)
+            vis_e_per_cam = None
+            num_cams = int(getattr(self.model, "num_cams", 0) or 0)
+            if getattr(self.model, "predict_per_cam_visibility", False) and num_cams > 0:
+                vis_e_per_cam = torch.zeros(
+                    (batch_size, num_frames, num_points, num_cams), device=rgbs.device
+                )
             for point_idx in tqdm(range(num_points), desc="Single point evaluation"):
                 # Support points for this query point
                 support_points_i = torch.zeros((batch_size, 0, 4), device=rgbs.device)
@@ -276,6 +282,8 @@ class EvaluationPredictor(torch.nn.Module):
                 )
                 traj_e[:, :, point_idx: point_idx + 1] = results_i["traj_e"][:, :, :1]
                 vis_e[:, :, point_idx: point_idx + 1] = results_i["vis_e"][:, :, :1]
+                if vis_e_per_cam is not None and "vis_e_per_cam" in results_i:
+                    vis_e_per_cam[:, :, point_idx: point_idx + 1] = results_i["vis_e_per_cam"][:, :, :1]
 
                 if save_debug_logs and (point_idx in [0, 1, 2, 3, 4] or point_idx % 100 == 0):
                     visualizer = MultiViewVisualizer(
@@ -360,6 +368,9 @@ class EvaluationPredictor(torch.nn.Module):
             traj_e = results["traj_e"][:, :, :num_points, :]
             vis_e = results["vis_e"][:, :, :num_points]
             traj2d_e = results["traj2d_e"][:, :, :num_points] if "traj2d_e" in results else None
+            vis_e_per_cam = None
+            if "vis_e_per_cam" in results:
+                vis_e_per_cam = results["vis_e_per_cam"][:, :, :num_points]
 
             if save_debug_logs:
                 visualizer = MultiViewVisualizer(
@@ -414,6 +425,9 @@ class EvaluationPredictor(torch.nn.Module):
             "vis_e": vis_e > self.visibility_threshold,
             "vis_e_as_prob": vis_e,
         }
+        if vis_e_per_cam is not None:
+            out["vis_e_per_cam"] = vis_e_per_cam > self.visibility_threshold
+            out["vis_e_per_cam_as_prob"] = vis_e_per_cam
         if traj2d_e is not None:
             out["traj2d_e"] = traj2d_e
         return out

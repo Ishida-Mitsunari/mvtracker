@@ -71,3 +71,30 @@ def sequence_loss_3d(flow_preds, flow_gt, vis, valids, gamma=0.8, dmin=0.1, dmax
         flow_loss = flow_loss / n_predictions
         total_flow_loss += flow_loss / float(J)
     return total_flow_loss
+
+
+def coarse_xy_huber_loss(coarse_preds, traj_gts, valids, query_gts, delta=0.8, disp_thresh=2.0):
+    """Huber on XY only, masked by valid and large GT displacement from the query frame.
+
+    Args:
+        coarse_preds: list of (B, S, N, 3) coarse window predictions.
+        traj_gts / valids: sliding-window GT aligned with ``sequence_loss_3d``.
+        query_gts: list of (B, N, 3) GT xyz at each track's query frame (same N as the window).
+        delta: Huber / SmoothL1 beta in metres.
+        disp_thresh: min GT XY displacement from the query frame (metres).
+    """
+    total = 0.0
+    j = 0
+    for pred, gt, valid, qgt in zip(coarse_preds, traj_gts, valids, query_gts):
+        assert pred.shape == gt.shape
+        pred_xy = pred[..., :2]
+        gt_xy = gt[..., :2]
+        q_xy = qgt[..., :2][:, None, :, :]
+        disp = (gt_xy - q_xy).norm(dim=-1)
+        mask = valid.float() * (disp > disp_thresh).float()
+        per = F.smooth_l1_loss(pred_xy, gt_xy, beta=delta, reduction="none").mean(dim=-1)
+        total = total + reduce_masked_mean(per, mask)
+        j += 1
+    if j == 0:
+        return torch.zeros((), device=traj_gts[0].device if traj_gts else "cpu")
+    return total / float(j)

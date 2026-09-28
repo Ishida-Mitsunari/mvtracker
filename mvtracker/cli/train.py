@@ -37,7 +37,7 @@ from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
 from mvtracker.datasets.nusctrack_dataset import NuscTrackDataset
 from mvtracker.datasets.panoptic_studio_multiview_dataset import PanopticStudioMultiViewDataset
 from mvtracker.datasets.utils import collate_fn, dataclass_to_cuda_
-from mvtracker.models.core.losses import balanced_ce_loss, sequence_loss_3d
+from mvtracker.models.core.losses import balanced_ce_loss, coarse_xy_huber_loss, sequence_loss_3d
 from mvtracker.models.core.model_utils import world_space_to_pixel_xy_and_camera_z, pixel_xy_and_camera_z_to_world_space
 from mvtracker.models.evaluation_predictor_3dpt import EvaluationPredictor as EvaluationPredictor3D
 from mvtracker.utils.visualizer_mp4 import MultiViewVisualizer, Visualizer
@@ -53,9 +53,36 @@ from collections import deque
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 
+def apply_trainable_name_prefixes(model, prefixes):
+    """Freeze every parameter whose name does not start with one of ``prefixes``.
+
+    Empty / missing prefixes leave the model unchanged (legacy experiments).
+    """
+    if not prefixes:
+        return
+    prefixes = [str(p) for p in prefixes]
+    n_on, n_off = 0, 0
+    for name, param in model.named_parameters():
+        trainable = any(name.startswith(pref) for pref in prefixes)
+        param.requires_grad = trainable
+        if trainable:
+            n_on += 1
+        else:
+            n_off += 1
+    logging.info(
+        "trainable_name_prefixes=%s: %s trainable tensors, %s frozen",
+        prefixes,
+        n_on,
+        n_off,
+    )
+
+
 def fetch_optimizer(trainer_cfg, model):
     """Create the optimizer and learning rate scheduler"""
-    optimizer = optim.AdamW(model.parameters(), lr=trainer_cfg.lr, weight_decay=trainer_cfg.wdecay)
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError("No trainable parameters after applying trainable_name_prefixes")
+    optimizer = optim.AdamW(params, lr=trainer_cfg.lr, weight_decay=trainer_cfg.wdecay)
     if trainer_cfg.anneal_strategy in ["linear", "cos"]:
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -141,13 +168,19 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
     vis_gts = []
     traj_gts = []
     valids_gts = []
+    vis_gts_per_cam = []
     query_points_t_min = query_points_3d[:, :, 0].long().min()
+    gt_visibilities_per_cam_btnv = gt_visibilities_per_view.permute(0, 2, 3, 1)  # B,T,N,V
     for i, wind_p_idx_end in enumerate(p_idx_end_list):
         gt_visibilities_any_view_sorted = gt_visibilities_any_view[:, :, sort_inds]
+        gt_visibilities_per_cam_sorted = gt_visibilities_per_cam_btnv[:, :, sort_inds]
         gt_trajectories_3d_worldspace_sorted = gt_trajectories_3d_worldspace[:, :, sort_inds]
         valid_tracks_per_frame_sorted = valid_tracks_per_frame[:, :, sort_inds]
         ind = query_points_t_min + i * (cfg.model.sliding_window_len // 2)
         vis_gts.append(gt_visibilities_any_view_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end])
+        vis_gts_per_cam.append(
+            gt_visibilities_per_cam_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end]
+        )
         traj_gts.append(
             gt_trajectories_3d_worldspace_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end])
         valids_gts.append(valid_tracks_per_frame_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end])
@@ -162,6 +195,49 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
                  f"{vis_predictions[-1][0, 0, 0]=}")
     xyz_loss = sequence_loss_3d(coord_predictions, traj_gts, vis_gts, valids_gts, gamma) * track_upscaling_factor
     vis_loss = balanced_ce_loss(vis_predictions, vis_gts, valids_gts)
+
+    per_cam_weight = float(cfg.trainer.get("per_cam_visibility_loss_weight", 0) or 0)
+    per_cam_vis_loss = xyz_loss.new_zeros(())
+    vis_predictions_per_cam = results["train_data"].get("vis_predictions_per_cam")
+    if (
+        per_cam_weight > 0
+        and bool(cfg.model.get("predict_per_cam_visibility", False))
+        and vis_predictions_per_cam
+    ):
+        # balanced_ce_loss expects (B, S, N); flatten cameras into N.
+        vis_preds_flat = []
+        vis_gts_flat = []
+        valids_flat = []
+        for j in range(len(vis_predictions_per_cam)):
+            pred_j = vis_predictions_per_cam[j]  # B, S, N, V
+            gt_j = vis_gts_per_cam[j].float()
+            B, S, N, V = pred_j.shape
+            assert gt_j.shape == (B, S, N, V)
+            vis_preds_flat.append(pred_j.reshape(B, S, N * V))
+            vis_gts_flat.append(gt_j.reshape(B, S, N * V))
+            valids_flat.append(valids_gts[j][..., None].expand(B, S, N, V).reshape(B, S, N * V))
+        per_cam_vis_loss = balanced_ce_loss(vis_preds_flat, vis_gts_flat, valids_flat)
+
+    coarse_weight = float(cfg.trainer.get("coarse_loss_weight", 0) or 0)
+    coarse_loss = xyz_loss.new_zeros(())
+    if coarse_weight > 0:
+        coarse_coords = results["train_data"].get("coarse_coords")
+        if not coarse_coords:
+            raise RuntimeError("trainer.coarse_loss_weight>0 but train_data has no coarse_coords")
+        qp_t = query_points_3d[:, :, 0].long().clamp(0, gt_trajectories_3d_worldspace.shape[1] - 1)
+        b_ix = torch.arange(batch_size, device=qp_t.device)[:, None].expand(batch_size, num_points)
+        n_ix = torch.arange(num_points, device=qp_t.device)[None, :].expand(batch_size, num_points)
+        query_gt_xyz = gt_trajectories_3d_worldspace[b_ix, qp_t, n_ix]
+        query_gt_sorted = query_gt_xyz[:, sort_inds]
+        query_gts = [query_gt_sorted[:, :wind_p_idx_end] for wind_p_idx_end in p_idx_end_list]
+        coarse_loss = coarse_xy_huber_loss(
+            coarse_coords,
+            traj_gts,
+            valids_gts,
+            query_gts,
+            delta=float(cfg.trainer.get("coarse_huber_delta", 0.8)),
+            disp_thresh=float(cfg.trainer.get("coarse_disp_thresh", 2.0)),
+        ) * track_upscaling_factor
 
     # Compute 3DPT metrics
     # eval_3dpt_results_dict = evaluate_3dpt(
@@ -209,6 +285,8 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
         f"seq={batch.seq_name}, "
         f"{xyz_loss.item()=}, "
         f"{vis_loss.item()=}, "
+        f"{per_cam_vis_loss.item()=}, "
+        f"{coarse_loss.item()=}, "
     )
 
     output = {
@@ -227,6 +305,10 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
         #     if "per_track" not in k
         # },
     }
+    if per_cam_weight > 0 and per_cam_vis_loss.numel() > 0:
+        output["visibility_per_cam"] = {"loss": per_cam_vis_loss * per_cam_weight}
+    if coarse_weight > 0:
+        output["coarse"] = {"loss": coarse_loss * coarse_weight}
     return output
 
 
@@ -600,6 +682,7 @@ def main(cfg: DictConfig):
 
     model: nn.Module = hydra.utils.instantiate(cfg.model)
     model.cuda()
+    apply_trainable_name_prefixes(model, cfg.trainer.get("trainable_name_prefixes", None))
     optimizer, scheduler = fetch_optimizer(cfg.trainer, model)
     model, optimizer = fabric.setup(model, optimizer)
 
@@ -648,7 +731,17 @@ def main(cfg: DictConfig):
                 fabric.load(restore_ckpt_path, state, strict=False)
             logging.info(f"Loaded checkpoint {restore_ckpt_path}")
         else:
-            fabric.load_raw(restore_ckpt_path, model)
+            # Raw / official weights (e.g. Kubric june2025). Allow missing keys for
+            # extended models such as SurroundTAP (new bev_corr_proj.*).
+            try:
+                fabric.load_raw(restore_ckpt_path, model, strict=True)
+            except RuntimeError as e:
+                logging.warning(
+                    f"Failed to load weights from {restore_ckpt_path} with strict=True: {e}. "
+                    f"Trying again with strict=False."
+                )
+                fabric.load_raw(restore_ckpt_path, model, strict=False)
+            logging.info(f"Loaded raw checkpoint {restore_ckpt_path}")
 
     tb_writer = SummaryWriter(log_dir=os.path.join(cfg.experiment_path, f"runs_{fabric.global_rank}"))
     if cfg.modes.eval_only or cfg.modes.validate_at_start:
